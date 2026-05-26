@@ -8,11 +8,13 @@ Use these values:
 
 | Field | Value |
 | --- | --- |
-| Homepage URL | `https://gittensory-api.zeronode.workers.dev` |
-| Webhook URL | `https://gittensory-api.zeronode.workers.dev/v1/github/webhook` |
+| Homepage URL | `https://gittensory.aethereal.dev` |
+| Webhook URL | `${GITTENSORY_API_URL}/v1/github/webhook` |
 | Webhook active | enabled |
 | SSL verification | enabled |
 | Device Flow | enabled |
+
+`GITTENSORY_API_URL` is the private API origin for the deployed backend. Do not use the GitHub Pages docs domain for webhooks; Pages only serves static docs.
 
 Use a generated webhook secret and set the same value in Cloudflare as `GITHUB_WEBHOOK_SECRET`.
 
