@@ -15,6 +15,8 @@
 
 - Use first-level api domain
 
+- Ignore stale beta api origins
+
 
 ## mcp-v0.1.4 - 2026-05-26
 

@@ -71,5 +71,7 @@
 
 - Recover public repo detail gaps
 
+- Ignore stale beta api origins
+
 
 

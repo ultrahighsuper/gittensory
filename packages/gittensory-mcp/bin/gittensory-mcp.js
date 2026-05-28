@@ -8,6 +8,7 @@ import { z } from "zod";
 import { buildBranchAnalysisPayload, collectLocalDiff, collectLocalBranchMetadata, setupGuidanceForLocalScorer } from "../lib/local-branch.js";
 
 const defaultApiUrl = "https://gittensory-api.aethereal.dev";
+const legacyDefaultApiUrls = new Set(["https://gittensory-api.zeronode.workers.dev"]);
 const packageName = "@jsonbored/gittensory-mcp";
 const packageVersion = "0.2.0";
 const changelogPath = new URL("../CHANGELOG.md", import.meta.url);
@@ -17,7 +18,8 @@ const configPath =
     ? join(process.env.GITTENSORY_CONFIG_DIR, "config.json")
     : join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "gittensory", "config.json"));
 const config = loadConfig();
-const apiUrl = (process.env.GITTENSORY_API_URL ?? config.apiUrl ?? defaultApiUrl).replace(/\/+$/, "");
+const configuredApiUrl = typeof config.apiUrl === "string" ? config.apiUrl.replace(/\/+$/, "") : undefined;
+const apiUrl = (process.env.GITTENSORY_API_URL ?? (configuredApiUrl && !legacyDefaultApiUrls.has(configuredApiUrl) ? configuredApiUrl : defaultApiUrl)).replace(/\/+$/, "");
 
 const ownerRepoShape = {
   owner: z.string().min(1),
