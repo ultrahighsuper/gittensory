@@ -1239,6 +1239,48 @@ describe("GitHub backfill", () => {
     );
   });
 
+  it("fetches every page when the limit is not a multiple of 100 (stable per_page offsets)", async () => {
+    const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "public-token" });
+    await seedRegisteredRepo(env);
+    const TOTAL = 150;
+    // Model GitHub's real pagination: `page` is an offset of `(page-1)*per_page`. If the crawl shrinks
+    // per_page mid-way (per_page=50 on page 2 after 100 fetched), it re-reads items 51-100 instead of
+    // 101-150, so those are never stored. A constant per_page=100 reads 1-100 then 101-150.
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url.endsWith("/repos/JSONbored/gittensory")) {
+        return Response.json({ name: "gittensory", full_name: "JSONbored/gittensory", private: false, default_branch: "main", language: "TypeScript", owner: { login: "JSONbored" } });
+      }
+      if (url.includes("/labels?")) return Response.json([]);
+      if (url.includes("/pulls?")) return Response.json([]);
+      if (url.includes("/issues?")) {
+        const params = new URL(url).searchParams;
+        const perPage = Number(params.get("per_page"));
+        const page = Number(params.get("page"));
+        const start = (page - 1) * perPage; // 0-based offset, as GitHub computes it
+        const slice = Array.from({ length: Math.max(0, Math.min(start + perPage, TOTAL) - start) }, (_, i) => ({
+          number: start + i + 1,
+          title: `Issue ${start + i + 1}`,
+          state: "open",
+          user: { login: "reporter" },
+          labels: [],
+          body: "",
+        }));
+        const hasNext = start + perPage < TOTAL;
+        return Response.json(slice, hasNext ? { headers: { link: `<https://api.github.com/repositories/1/issues?page=${page + 1}>; rel="next"` } } : undefined);
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    const result = await backfillRegisteredRepositories(env, {
+      mode: "full",
+      limits: { issues: TOTAL, pullRequests: 0, recentMergedPullRequests: 0, pullRequestDetails: 0 },
+    });
+
+    // All 150 unique issues must be stored — not 100 (which is what a shrinking-per_page crawl yields).
+    expect(result.repos[0]).toMatchObject({ status: "success", openIssues: TOTAL });
+  });
+
   it("runs a targeted labels segment refresh", async () => {
     const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "public-token" });
     await seedRegisteredRepo(env);

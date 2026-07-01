@@ -3093,22 +3093,33 @@ async function githubPaged<T>(
 
   try {
     for (let page = startPage; items.length < limit; page += 1) {
-      const pageLimit = Math.min(100, limit - items.length);
+      // Hold `per_page` at 100 across the whole crawl: GitHub's `page` offset is `(page-1)*per_page`, so
+      // SHRINKING per_page as the budget depletes (e.g. per_page=50 on page 2 after 100 fetched) re-requests
+      // an already-seen slice instead of the next one — silently dropping items past the first page whenever
+      // `limit` is not a multiple of 100. Cap by trimming the accumulated items to `limit` instead. This also
+      // matches every other paginator in this file, which all request a constant `per_page=100`.
       const separator = path.includes("?") ? "&" : "?";
-      const pagePath = `${path}${separator}per_page=${pageLimit}&page=${page}`;
+      const pagePath = `${path}${separator}per_page=100&page=${page}`;
       const result = await githubJsonWithHeaders<T[]>(env, repo.fullName, pagePath, token, githubRateLimitOptions(admissionKey));
       etag = result.etag ?? etag;
       lastModified = result.lastModified ?? lastModified;
       lastCursor = String(page);
       pageCount += 1;
-      items.push(...result.data);
+      const remaining = limit - items.length;
+      const truncatedPage = result.data.length > remaining;
+      items.push(...result.data.slice(0, remaining));
       const hasNext = hasNextPage(result.link);
-      if (result.data.length < pageLimit || !hasNext) break;
-      nextCursor = String(page + 1);
-      if (items.length >= limit) {
+      // Reached the local cap with more still upstream (a next page is advertised, or this page held more
+      // than the cap left room for): stop and record a live resume cursor. Resume re-fetches the partially
+      // consumed page (its already-stored rows dedupe on number).
+      if (items.length >= limit && (hasNext || truncatedPage)) {
+        nextCursor = String(truncatedPage ? page : page + 1);
         status = "capped";
         warnings.push(`GitHub sync reached local cap of ${limit} item(s) for ${path}; next page cursor is ${nextCursor}.`);
+        break;
       }
+      if (result.data.length < 100 || !hasNext) break;
+      nextCursor = String(page + 1);
     }
   } catch (error) {
     status = error instanceof GitHubApiError && error.rateLimited ? "rate_limited" : items.length > 0 ? "partial" : "error";
