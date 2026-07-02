@@ -9,6 +9,7 @@ import type {
 } from "../types.js";
 import type { AnalysisContext } from "../analysis-context.js";
 import { boundedFetchJson } from "../external-fetch.js";
+import { fixedOf } from "./osv-fixed.js";
 
 export interface DepChange {
   ecosystem: string;
@@ -142,7 +143,7 @@ interface OsvVuln {
   details?: string;
   severity?: Array<{ type: string; score: string }>;
   database_specific?: { severity?: string };
-  affected?: Array<{ ranges?: Array<{ events?: Array<{ fixed?: string }> }> }>;
+  affected?: Array<{ ranges?: Array<{ events?: Array<{ introduced?: string; fixed?: string }> }> }>;
 }
 
 function severityOf(vuln: OsvVuln): Cve["severity"] {
@@ -167,25 +168,14 @@ function severityOf(vuln: OsvVuln): Cve["severity"] {
         : "low";
 }
 
-function fixedOf(vuln: OsvVuln): string | null {
-  for (const affected of vuln.affected ?? []) {
-    for (const range of affected.ranges ?? []) {
-      for (const event of range.events ?? []) {
-        if (event.fixed) return event.fixed;
-      }
-    }
-  }
-  return null;
-}
-
-function mapOsvVulns(vulns: OsvVuln[] | undefined): Cve[] {
+function mapOsvVulns(vulns: OsvVuln[] | undefined, queriedVersion?: string): Cve[] {
   return (vulns ?? []).map((vuln) => ({
     id: vuln.id,
     severity: severityOf(vuln),
     summary: (vuln.summary ?? vuln.details ?? "")
       .replace(/\s+/g, " ")
       .slice(0, 180),
-    fixedIn: fixedOf(vuln),
+    fixedIn: fixedOf(vuln, queriedVersion),
   }));
 }
 
@@ -222,7 +212,7 @@ async function fetchOsvDirect(
         fetchOptions,
       );
   if (!response.ok) return [];
-  return mapOsvVulns(response.data.vulns);
+  return mapOsvVulns(response.data.vulns, version);
 }
 
 /* Legacy direct path kept for tests and injected callers that do not have request context. */
@@ -329,7 +319,7 @@ export async function queryOsvBatch(
     chunk.forEach((change, index) => {
       results.set(
         osvCacheKey(change),
-        mapOsvVulns(response.data.results?.[index]?.vulns),
+        mapOsvVulns(response.data.results?.[index]?.vulns, change.to),
       );
     });
   }

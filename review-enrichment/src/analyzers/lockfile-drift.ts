@@ -10,6 +10,7 @@ import type {
 import type { AnalysisContext } from "../analysis-context.js";
 import { extractDependencyChanges } from "./dependency-scan.js";
 import { boundedFetchJson } from "../external-fetch.js";
+import { fixedOf } from "./osv-fixed.js";
 
 interface LockfileChange {
   file: string;
@@ -45,7 +46,7 @@ interface OsvVuln {
   details?: string;
   severity?: Array<{ type: string; score: string }>;
   database_specific?: { severity?: string };
-  affected?: Array<{ ranges?: Array<{ events?: Array<{ fixed?: string }> }> }>;
+  affected?: Array<{ ranges?: Array<{ events?: Array<{ introduced?: string; fixed?: string }> }> }>;
 }
 
 const MAX_LOCKFILE_FILES = 12;
@@ -79,25 +80,14 @@ function severityOf(vuln: OsvVuln): Cve["severity"] {
         : "low";
 }
 
-function fixedOf(vuln: OsvVuln): string | null {
-  for (const affected of vuln.affected ?? []) {
-    for (const range of affected.ranges ?? []) {
-      for (const event of range.events ?? []) {
-        if (event.fixed) return event.fixed;
-      }
-    }
-  }
-  return null;
-}
-
-function toCves(vulns: OsvVuln[] | undefined): Cve[] {
+function toCves(vulns: OsvVuln[] | undefined, queriedVersion?: string): Cve[] {
   return (vulns ?? []).map((vuln) => ({
     id: vuln.id,
     severity: severityOf(vuln),
     summary: (vuln.summary ?? vuln.details ?? "")
       .replace(/\s+/g, " ")
       .slice(0, 180),
-    fixedIn: fixedOf(vuln),
+    fixedIn: fixedOf(vuln, queriedVersion),
   }));
 }
 
@@ -401,7 +391,7 @@ export async function queryOsvBatch(
   changes.forEach((change, index) => {
     results.set(
       `${change.ecosystem}::${change.package}@${change.to}`,
-      toCves(response.data.results?.[index]?.vulns),
+      toCves(response.data.results?.[index]?.vulns, change.to),
     );
   });
   return results;
