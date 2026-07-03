@@ -290,18 +290,15 @@ describe("extractSubmittedSourceUrls — frontmatter parsing edge cases", () => 
     );
   });
 
-  it("does not surface a non-bare block-scalar indicator on a list field as a bogus URL", () => {
-    // `retrievalSources` is a list field; a block-scalar indicator (`|-`, `>-`, `|2`, …) is not a URL. The old
-    // guard only skipped the bare `|`/`>`, so `|-` leaked through as the literal url "|-".
-    for (const indicator of ["|-", ">-", "|+", "|2", ">2"]) {
+  it("does not surface any block-scalar header on a list field as a bogus URL (both indicator orders)", () => {
+    // `retrievalSources` is a list field; a block-scalar header is not a URL. The old guard only skipped the bare
+    // `|`/`>`, so `|-` leaked as the literal url "|-". YAML allows chomping and the indentation digit in EITHER
+    // order, so `|2-`/`>2+` (indent-then-chomp) and bare chomping `|+`/`|-` must all be skipped too.
+    const indicators = ["|", ">", "|-", ">-", "|+", ">+", "|2", ">2", "|-2", "|2-", ">2+", ">2-"];
+    for (const indicator of indicators) {
       const src = ["---", `retrievalSources: ${indicator}`, "  https://a.example/1", "  https://b.example/2", "---", "", "body"].join("\n");
       const urls = extractSubmittedSourceUrls(src);
       expect(urls.some((u) => u.url === indicator)).toBe(false);
-    }
-    // The bare forms were already skipped and must stay skipped.
-    for (const indicator of ["|", ">"]) {
-      const src = ["---", `retrievalSources: ${indicator}`, "  https://a.example/1", "---", "", "body"].join("\n");
-      expect(extractSubmittedSourceUrls(src).some((u) => u.url === indicator)).toBe(false);
     }
   });
 
