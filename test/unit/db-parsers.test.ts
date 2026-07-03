@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   claimRegateFanoutSlot,
   countRecentDeadLetters,
+  countRecentDeadLettersByType,
   countRecentAuditEventsForActorAndTarget,
+  hasAuditEventForDelivery,
   getLatestScorePreview,
   getRepoAuthorPullRequestHistory,
   getLatestScoringModelSnapshot,
@@ -373,6 +375,109 @@ describe("database row parser hardening", () => {
     expect(await countRecentDeadLetters(env, "2026-06-24T13:00:00.000Z")).toBe(0); // none after the cutoff → count(*) returns 0
   });
 
+  it("countRecentDeadLettersByType groups recent dead letters by job type in deterministic key order (#1208)", async () => {
+    const env = createTestEnv();
+    await recordAuditEvent(env, {
+      eventType: "github_app.dlq_dead_lettered",
+      actor: "gittensory",
+      targetKey: "dlq:github-webhook:a",
+      outcome: "error",
+      createdAt: "2026-06-24T12:00:00.000Z",
+      metadata: { jobType: "github-webhook" },
+    });
+    await recordAuditEvent(env, {
+      eventType: "github_app.dlq_dead_lettered",
+      actor: "gittensory",
+      targetKey: "dlq:backfill-repo-segment:b",
+      outcome: "error",
+      createdAt: "2026-06-24T10:00:00.000Z",
+      metadata: { jobType: "backfill-repo-segment" },
+    });
+    await recordAuditEvent(env, {
+      eventType: "github_app.dlq_dead_lettered",
+      actor: "gittensory",
+      targetKey: "dlq:github-webhook:c",
+      outcome: "error",
+      createdAt: "2026-06-24T14:00:00.000Z",
+      metadata: { jobType: "github-webhook" },
+    });
+
+    const counts = await countRecentDeadLettersByType(env, "2026-06-24T09:00:00.000Z");
+    expect(counts).toEqual({
+      "backfill-repo-segment": 1,
+      "github-webhook": 2,
+    });
+    expect(Object.keys(counts)).toEqual(["backfill-repo-segment", "github-webhook"]);
+  });
+
+  it("countRecentDeadLettersByType returns a single grouped key when only one job type is present", async () => {
+    const env = createTestEnv();
+    await recordAuditEvent(env, {
+      eventType: "github_app.dlq_dead_lettered",
+      actor: "gittensory",
+      targetKey: "dlq:refresh-registry:a",
+      outcome: "error",
+      createdAt: "2026-06-24T10:00:00.000Z",
+      metadata: { jobType: "refresh-registry" },
+    });
+    await recordAuditEvent(env, {
+      eventType: "github_app.dlq_dead_lettered",
+      actor: "gittensory",
+      targetKey: "dlq:refresh-registry:b",
+      outcome: "error",
+      createdAt: "2026-06-24T11:00:00.000Z",
+      metadata: { jobType: "refresh-registry" },
+    });
+
+    expect(await countRecentDeadLettersByType(env, "2026-06-24T09:00:00.000Z")).toEqual({
+      "refresh-registry": 2,
+    });
+  });
+
+  it("countRecentDeadLettersByType returns an empty object when no recent dead letters exist", async () => {
+    const env = createTestEnv();
+    await recordAuditEvent(env, {
+      eventType: "github_app.dlq_dead_lettered",
+      actor: "gittensory",
+      targetKey: "dlq:github-webhook:stale",
+      outcome: "error",
+      createdAt: "2026-06-24T08:59:59.000Z",
+      metadata: { jobType: "github-webhook" },
+    });
+    await recordAuditEvent(env, {
+      eventType: "agent.sweep.regate",
+      actor: "gittensory",
+      targetKey: "owner/repo",
+      outcome: "completed",
+      createdAt: "2026-06-24T12:00:00.000Z",
+    });
+
+    expect(await countRecentDeadLettersByType(env, "2026-06-24T09:00:00.000Z")).toEqual({});
+  });
+
+  it("countRecentDeadLettersByType falls back missing or blank job types to unknown", async () => {
+    const env = createTestEnv();
+    await recordAuditEvent(env, {
+      eventType: "github_app.dlq_dead_lettered",
+      actor: "gittensory",
+      targetKey: "dlq:unknown:a",
+      outcome: "error",
+      createdAt: "2026-06-24T10:00:00.000Z",
+    });
+    await recordAuditEvent(env, {
+      eventType: "github_app.dlq_dead_lettered",
+      actor: "gittensory",
+      targetKey: "dlq:unknown:b",
+      outcome: "error",
+      createdAt: "2026-06-24T11:00:00.000Z",
+      metadata: { jobType: "   " },
+    });
+
+    expect(await countRecentDeadLettersByType(env, "2026-06-24T09:00:00.000Z")).toEqual({
+      unknown: 2,
+    });
+  });
+
   it("countRecentAuditEventsForActorAndTarget counts events scoped to ONE actor+eventType+targetKey since a cutoff (#2463)", async () => {
     const env = createTestEnv();
     await recordAuditEvent(env, { eventType: "github_app.review_nag_ping", actor: "chatty", targetKey: "owner/repo#1", outcome: "completed", createdAt: "2026-06-24T10:00:00.000Z" });
@@ -387,6 +492,56 @@ describe("database row parser hardening", () => {
     expect(await countRecentAuditEventsForActorAndTarget(env, "chatty", "github_app.review_nag_ping", "owner/repo#1", "2026-06-24T09:00:00.000Z")).toBe(2);
     expect(await countRecentAuditEventsForActorAndTarget(env, "chatty", "github_app.review_nag_ping", "owner/repo#1", "2026-06-24T11:00:00.000Z")).toBe(1); // only the 12:00 one
     expect(await countRecentAuditEventsForActorAndTarget(env, "chatty", "github_app.review_nag_ping", "owner/repo#1", "2026-06-24T13:00:00.000Z")).toBe(0); // none after the cutoff → count(*) returns 0
+  });
+
+  it("hasAuditEventForDelivery finds a matching deliveryId inside metadata_json, scoped to actor+eventType+targetKey (#2560)", async () => {
+    const env = createTestEnv();
+    await recordAuditEvent(env, {
+      eventType: "github_app.command_invocation",
+      actor: "maintainer",
+      targetKey: "owner/repo#1#help",
+      outcome: "completed",
+      createdAt: "2026-06-24T10:00:00.000Z",
+      metadata: { deliveryId: "delivery-a" },
+    });
+
+    expect(await hasAuditEventForDelivery(env, "maintainer", "github_app.command_invocation", "owner/repo#1#help", "delivery-a", "2026-06-24T09:00:00.000Z")).toBe(true);
+    // A different deliveryId on the SAME actor+eventType+targetKey must not match.
+    expect(await hasAuditEventForDelivery(env, "maintainer", "github_app.command_invocation", "owner/repo#1#help", "delivery-b", "2026-06-24T09:00:00.000Z")).toBe(false);
+    // The SAME deliveryId but for a DIFFERENT command's targetKey must not match (each command's own counter).
+    expect(await hasAuditEventForDelivery(env, "maintainer", "github_app.command_invocation", "owner/repo#1#ask", "delivery-a", "2026-06-24T09:00:00.000Z")).toBe(false);
+    // A cutoff AFTER the recorded event must not match (outside the recent window).
+    expect(await hasAuditEventForDelivery(env, "maintainer", "github_app.command_invocation", "owner/repo#1#help", "delivery-a", "2026-06-24T11:00:00.000Z")).toBe(false);
+  });
+
+  it("REGRESSION (gate-flagged): hasAuditEventForDelivery still finds the matching deliveryId when MORE than 50 other rows exist in the window (burst/spam scenario)", async () => {
+    // A prior version matched deliveryId IN MEMORY over a `.limit(50)` slice with no ORDER BY, so once an
+    // actor had more than 50 matching rows in the window, the row carrying the target deliveryId could be
+    // excluded from that arbitrary slice -- a false negative right when a burst/spam scenario (the abuse
+    // case this feature exists to handle) makes it most likely. The fix pushes the deliveryId match into the
+    // SQL predicate itself, so it must still be found regardless of how many OTHER rows exist.
+    const env = createTestEnv();
+    for (let i = 0; i < 60; i += 1) {
+      await recordAuditEvent(env, {
+        eventType: "github_app.command_invocation",
+        actor: "maintainer",
+        targetKey: "owner/repo#1#help",
+        outcome: "completed",
+        createdAt: "2026-06-24T10:00:00.000Z",
+        metadata: { deliveryId: `delivery-noise-${i}` },
+      });
+    }
+    await recordAuditEvent(env, {
+      eventType: "github_app.command_invocation",
+      actor: "maintainer",
+      targetKey: "owner/repo#1#help",
+      outcome: "completed",
+      createdAt: "2026-06-24T10:00:00.000Z",
+      metadata: { deliveryId: "delivery-target" },
+    });
+
+    expect(await hasAuditEventForDelivery(env, "maintainer", "github_app.command_invocation", "owner/repo#1#help", "delivery-target", "2026-06-24T09:00:00.000Z")).toBe(true);
+    expect(await hasAuditEventForDelivery(env, "maintainer", "github_app.command_invocation", "owner/repo#1#help", "delivery-never-recorded", "2026-06-24T09:00:00.000Z")).toBe(false);
   });
 
   it("computes complete case-insensitive repo author PR history for gate grace", async () => {

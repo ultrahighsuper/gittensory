@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   buildFocusManifestGuidance,
@@ -167,6 +168,20 @@ describe("parseFocusManifestContent", () => {
     const manifest = parseFocusManifestContent("wantedPaths: [unterminated", "repo_file");
     expect(manifest.present).toBe(false);
     expect(manifest.warnings.join(" ")).toMatch(/not valid YAML/i);
+  });
+
+  it("parses .gittensory.yml.example with zero warnings (#2554: doc must match parser exactly)", () => {
+    const content = readFileSync(".gittensory.yml.example", "utf8");
+    const manifest = parseFocusManifestContent(content, "repo_file");
+    expect(manifest.warnings).toEqual([]);
+    expect(manifest.present).toBe(true);
+    // Spot-check the 4 knobs #2554 added docs for actually round-trip through the real parser.
+    expect(manifest.gate.sizeMode).toBe("off");
+    expect(manifest.gate.dryRun).toBe(false);
+    expect(manifest.gate.selfAuthoredLinkedIssue).toBe("advisory");
+    expect(manifest.gate.aiReviewCloseConfidence).toBeNull();
+    // #2552: requireFreshRebaseWindow also round-trips through the real parser.
+    expect(manifest.gate.requireFreshRebaseWindowMinutes).toBe(10);
   });
 });
 
@@ -479,7 +494,7 @@ describe("compileFocusManifestPolicy", () => {
       issueDiscoveryPolicy: "neutral",
       maintainerNotes: [],
       publicNotes: ["Keep PRs focused.", "Maximize your reward payout"],
-      gate: { present: false, enabled: null, pack: null, linkedIssue: null, duplicates: null, readinessMode: null, readinessMinScore: null, slopMode: null, slopMinScore: null, slopAiAdvisory: null, sizeMode: null, aiReviewMode: null, aiReviewByok: null, aiReviewProvider: null, aiReviewModel: null, aiReviewAllAuthors: null, aiReviewCloseConfidence: null, mergeReadiness: null, selfAuthoredLinkedIssue: null, manifestPolicy: null, dryRun: null, firstTimeContributorGrace: null },
+      gate: { present: false, enabled: null, pack: null, linkedIssue: null, duplicates: null, readinessMode: null, readinessMinScore: null, slopMode: null, slopMinScore: null, slopAiAdvisory: null, sizeMode: null, aiReviewMode: null, aiReviewByok: null, aiReviewProvider: null, aiReviewModel: null, aiReviewAllAuthors: null, aiReviewCloseConfidence: null, mergeReadiness: null, selfAuthoredLinkedIssue: null, manifestPolicy: null, dryRun: null, firstTimeContributorGrace: null, premergeContentRecheck: null, requireFreshRebaseWindowMinutes: null },
       settings: {},
       review: { present: false, footerText: null, note: null, fields: {}, profile: null, inlineComments: null, pathInstructions: [], instructions: null, excludePaths: [], preMergeChecks: [] },
       features: { present: false, rag: null, reputation: null, unifiedComment: null, safety: null },
@@ -787,7 +802,7 @@ describe("parseFocusManifest gate config", () => {
     // the block→advisory deprecation-downgrade behavior itself is covered separately below.
     const m = parseFocusManifest({ gate: { linkedIssue: "block", duplicates: "advisory", readiness: { mode: "advisory", minScore: 70 } } });
     expect(m.present).toBe(true);
-    expect(m.gate).toEqual({ present: true, enabled: null, pack: null, linkedIssue: "block", duplicates: "advisory", readinessMode: "advisory", readinessMinScore: 70, slopMode: null, slopMinScore: null, slopAiAdvisory: null, sizeMode: null, aiReviewMode: null, aiReviewByok: null, aiReviewProvider: null, aiReviewModel: null, aiReviewAllAuthors: null, aiReviewCloseConfidence: null, mergeReadiness: null, selfAuthoredLinkedIssue: null, manifestPolicy: null, dryRun: null, firstTimeContributorGrace: null });
+    expect(m.gate).toEqual({ present: true, enabled: null, pack: null, linkedIssue: "block", duplicates: "advisory", readinessMode: "advisory", readinessMinScore: 70, slopMode: null, slopMinScore: null, slopAiAdvisory: null, sizeMode: null, aiReviewMode: null, aiReviewByok: null, aiReviewProvider: null, aiReviewModel: null, aiReviewAllAuthors: null, aiReviewCloseConfidence: null, mergeReadiness: null, selfAuthoredLinkedIssue: null, manifestPolicy: null, dryRun: null, firstTimeContributorGrace: null, premergeContentRecheck: null, requireFreshRebaseWindowMinutes: null });
   });
 
   it("parses gate.mergeReadiness + gate.firstTimeContributorGrace, round-trips them, and warns on bad values (#822)", () => {
@@ -1367,6 +1382,53 @@ describe("parseFocusManifest settings override + resolveEffectiveSettings", () =
     expect(invalid.warnings.some((w) => /settings\.reviewNagPolicy/.test(w))).toBe(true);
     expect(invalid.warnings.some((w) => /settings\.reviewNagMaxPings/.test(w))).toBe(true);
     expect(invalid.warnings.some((w) => /settings\.reviewNagCooldownDays/.test(w))).toBe(true);
+    const tooLarge = parseFocusManifest({ settings: { reviewNagCooldownDays: 366 } });
+    expect(tooLarge.settings.reviewNagCooldownDays).toBeUndefined();
+    expect(tooLarge.warnings.some((w) => /settings\.reviewNagCooldownDays/.test(w) && /365/.test(w))).toBe(true);
+  });
+
+  it("parses + resolves the account-age throttle settings from the settings: block, overlaying the DB (#2561)", () => {
+    const manifest = parseFocusManifest({ settings: { accountAgeThresholdDays: 14, newAccountLabel: "fresh-account" } });
+    expect(manifest.settings.accountAgeThresholdDays).toBe(14);
+    expect(manifest.settings.newAccountLabel).toBe("fresh-account");
+    const eff = resolveEffectiveSettings({ accountAgeThresholdDays: null, newAccountLabel: "new-account" } as unknown as RepositorySettings, manifest);
+    expect(eff.accountAgeThresholdDays).toBe(14);
+    // An explicit yml `null` clears a DB-configured threshold back to off (load-bearing null).
+    const cleared = resolveEffectiveSettings({ accountAgeThresholdDays: 30 } as unknown as RepositorySettings, parseFocusManifest({ settings: { accountAgeThresholdDays: null } }));
+    expect(cleared.accountAgeThresholdDays).toBeNull();
+    // Omitted in yml ⇒ the DB-configured threshold survives untouched.
+    const noOverride = resolveEffectiveSettings({ accountAgeThresholdDays: 7 } as unknown as RepositorySettings, parseFocusManifest({}));
+    expect(noOverride.accountAgeThresholdDays).toBe(7);
+    // A non-positive threshold is dropped with a warning rather than silently coerced.
+    const invalid = parseFocusManifest({ settings: { accountAgeThresholdDays: 0 } });
+    expect(invalid.settings.accountAgeThresholdDays).toBeUndefined();
+    expect(invalid.warnings.some((w) => /settings\.accountAgeThresholdDays/.test(w))).toBe(true);
+  });
+
+  it("parses + resolves the per-command rate limit settings from the settings: block, overlaying the DB (#2560)", () => {
+    const manifest = parseFocusManifest({ settings: { commandRateLimitPolicy: "hold", commandRateLimitMaxPerWindow: 10, commandRateLimitAiMaxPerWindow: 2, commandRateLimitWindowHours: 12 } });
+    expect(manifest.settings.commandRateLimitPolicy).toBe("hold");
+    expect(manifest.settings.commandRateLimitMaxPerWindow).toBe(10);
+    expect(manifest.settings.commandRateLimitAiMaxPerWindow).toBe(2);
+    expect(manifest.settings.commandRateLimitWindowHours).toBe(12);
+    // yml overlays a DB-configured policy.
+    const eff = resolveEffectiveSettings({ commandRateLimitPolicy: "off", commandRateLimitMaxPerWindow: 20, commandRateLimitAiMaxPerWindow: 5, commandRateLimitWindowHours: 24 } as unknown as RepositorySettings, manifest);
+    expect(eff.commandRateLimitPolicy).toBe("hold");
+    expect(eff.commandRateLimitMaxPerWindow).toBe(10);
+    // Omitted in yml ⇒ the DB-configured policy survives untouched.
+    const noOverride = resolveEffectiveSettings({ commandRateLimitPolicy: "hold", commandRateLimitAiMaxPerWindow: 3 } as unknown as RepositorySettings, parseFocusManifest({}));
+    expect(noOverride.commandRateLimitPolicy).toBe("hold");
+    expect(noOverride.commandRateLimitAiMaxPerWindow).toBe(3);
+    // An invalid policy enum / non-positive window value is dropped with a warning rather than silently coerced.
+    const invalid = parseFocusManifest({ settings: { commandRateLimitPolicy: "close" as never, commandRateLimitMaxPerWindow: 0, commandRateLimitAiMaxPerWindow: -1, commandRateLimitWindowHours: -5 } });
+    expect(invalid.settings.commandRateLimitPolicy).toBeUndefined();
+    expect(invalid.settings.commandRateLimitMaxPerWindow).toBeUndefined();
+    expect(invalid.settings.commandRateLimitAiMaxPerWindow).toBeUndefined();
+    expect(invalid.settings.commandRateLimitWindowHours).toBeUndefined();
+    expect(invalid.warnings.some((w) => /settings\.commandRateLimitPolicy/.test(w))).toBe(true);
+    expect(invalid.warnings.some((w) => /settings\.commandRateLimitMaxPerWindow/.test(w))).toBe(true);
+    expect(invalid.warnings.some((w) => /settings\.commandRateLimitAiMaxPerWindow/.test(w))).toBe(true);
+    expect(invalid.warnings.some((w) => /settings\.commandRateLimitWindowHours/.test(w))).toBe(true);
   });
 
   it("parses + resolves autoCloseExemptLogins from the settings: block, overlaying the DB (#2463)", () => {
@@ -1424,6 +1486,18 @@ describe("parseFocusManifest settings override + resolveEffectiveSettings", () =
     expect(eff.autoLabelEnabled).toBe(false); // settings: override (boolean)
     expect(eff.gateCheckMode).toBe("enabled"); // gate.enabled
     expect(eff.linkedIssueGateMode).toBe("block"); // gate: wins over settings:
+  });
+
+  it("wires settings.badgeEnabled into the manifest parser and lets it override the DB value (#2555)", () => {
+    const parsedTrue = parseFocusManifest({ settings: { badgeEnabled: true } });
+    expect(parsedTrue.settings.badgeEnabled).toBe(true);
+    expect(parsedTrue.warnings).toEqual([]);
+    const parsedFalse = parseFocusManifest({ settings: { badgeEnabled: false } });
+    expect(parsedFalse.settings.badgeEnabled).toBe(false);
+
+    const db = { badgeEnabled: false } as unknown as RepositorySettings;
+    const eff = resolveEffectiveSettings(db, parseFocusManifest({ settings: { badgeEnabled: true } }));
+    expect(eff.badgeEnabled).toBe(true); // settings: override wins over the DB-stored value
   });
 
   it("parses aiReview from settings: and lets gate.aiReview win in resolveEffectiveSettings", () => {
@@ -1516,6 +1590,18 @@ describe("parseFocusManifest review config", () => {
     const chill = parseFocusManifest({ review: { profile: "chill" } });
     expect(chill.review.present).toBe(true);
     expect(parseFocusManifest({ review: reviewConfigToJson(chill.review) }).review).toEqual(chill.review);
+  });
+
+  it("parses gate tri-state modes case-insensitively like review.profile", () => {
+    const manifest = parseFocusManifest({
+      gate: { linkedIssue: "BLOCK", duplicates: "Advisory", size: { mode: "OFF" } },
+      settings: { linkedIssueGateMode: "Block" },
+    });
+    expect(manifest.gate.linkedIssue).toBe("block");
+    expect(manifest.gate.duplicates).toBe("advisory");
+    expect(manifest.gate.sizeMode).toBe("off");
+    expect(manifest.settings.linkedIssueGateMode).toBe("block");
+    expect(resolveEffectiveSettings({ linkedIssueGateMode: "off" } as RepositorySettings, manifest).linkedIssueGateMode).toBe("block");
   });
 
   it("ignores an invalid review.profile with a warning", () => {
@@ -1781,5 +1867,63 @@ describe("gate.dryRun dry-run disposition config (#gate-dryrun)", () => {
     expect(m.gate.dryRun).toBe(true);
     expect(m.gate.present).toBe(true);
     expect(gateConfigToJson(m.gate)).toMatchObject({ dryRun: true });
+  });
+});
+
+describe("gate.premergeContentRecheck live migration-collision recheck config (#2550)", () => {
+  it("parses gate.premergeContentRecheck, sets present, round-trips, and resolves into effective settings", () => {
+    const m = parseFocusManifest({ gate: { premergeContentRecheck: true } });
+    expect(m.gate.premergeContentRecheck).toBe(true);
+    expect(m.gate.present).toBe(true);
+    expect(gateConfigToJson(m.gate)).toMatchObject({ premergeContentRecheck: true });
+    const eff = resolveEffectiveSettings({} as unknown as RepositorySettings, m);
+    expect(eff.premergeContentRecheck).toBe(true);
+  });
+
+  it("defaults to unset/undefined when omitted — byte-identical to today", () => {
+    const m = parseFocusManifest({});
+    expect(m.gate.premergeContentRecheck).toBeNull();
+    const eff = resolveEffectiveSettings({} as unknown as RepositorySettings, m);
+    expect(eff.premergeContentRecheck).toBeUndefined();
+  });
+
+  it("warns and drops an invalid (non-boolean) value rather than silently coercing it", () => {
+    const m = parseFocusManifest({ gate: { premergeContentRecheck: "yes" as never } });
+    expect(m.gate.premergeContentRecheck).toBeNull();
+    expect(m.warnings.some((w) => /gate\.premergeContentRecheck/i.test(w))).toBe(true);
+  });
+});
+
+describe("gate.requireFreshRebaseWindow force-rebase-before-merge config (#2552)", () => {
+  it("parses gate.requireFreshRebaseWindow, sets present, round-trips, and resolves into effective settings", () => {
+    const m = parseFocusManifest({ gate: { requireFreshRebaseWindow: 10 } });
+    expect(m.gate.requireFreshRebaseWindowMinutes).toBe(10);
+    expect(m.gate.present).toBe(true);
+    expect(gateConfigToJson(m.gate)).toMatchObject({ requireFreshRebaseWindow: 10 });
+    const eff = resolveEffectiveSettings({} as unknown as RepositorySettings, m);
+    expect(eff.requireFreshRebaseWindowMinutes).toBe(10);
+  });
+
+  it("defaults to unset/undefined when omitted — byte-identical to today", () => {
+    const m = parseFocusManifest({});
+    expect(m.gate.requireFreshRebaseWindowMinutes).toBeNull();
+    const eff = resolveEffectiveSettings({} as unknown as RepositorySettings, m);
+    expect(eff.requireFreshRebaseWindowMinutes).toBeUndefined();
+  });
+
+  it("warns and drops a fractional/non-positive value rather than silently coercing it", () => {
+    const fractional = parseFocusManifest({ gate: { requireFreshRebaseWindow: 2.5 } });
+    expect(fractional.gate.requireFreshRebaseWindowMinutes).toBeNull();
+    expect(fractional.warnings.some((w) => /gate\.requireFreshRebaseWindow/i.test(w))).toBe(true);
+
+    const nonPositive = parseFocusManifest({ gate: { requireFreshRebaseWindow: 0 } });
+    expect(nonPositive.gate.requireFreshRebaseWindowMinutes).toBeNull();
+    expect(nonPositive.warnings.some((w) => /gate\.requireFreshRebaseWindow/i.test(w))).toBe(true);
+  });
+
+  it("lets the DB value pass through when the manifest doesn't override it", () => {
+    const db = { requireFreshRebaseWindowMinutes: 15 } as unknown as RepositorySettings;
+    const eff = resolveEffectiveSettings(db, parseFocusManifest(null));
+    expect(eff.requireFreshRebaseWindowMinutes).toBe(15);
   });
 });

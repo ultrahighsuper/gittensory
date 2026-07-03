@@ -24,6 +24,8 @@ import {
   jobPriority,
   parsePositiveIntEnv,
   queueBackgroundConcurrency,
+  queueDeadLetterAutoRetryMaxExtraAttempts,
+  queueDeadLetterReviveIntervalMs,
   queueProcessingTimeoutMs,
   queueRecoveryJitterMs,
   queueStartupJitterMinJobs,
@@ -68,6 +70,10 @@ export interface PgDurableQueue {
   deadCount(): Promise<number>;
   stats(): Promise<Record<string, number>>;
   snapshot(): Promise<SelfHostQueueSnapshot>;
+  /** Requeues dead-lettered jobs still under the auto-retry attempts ceiling. Called on a timer while
+   *  running (see start()), and exposed directly so tests and an operator-triggered repair path don't have
+   *  to wait for the real interval. Returns the number of jobs revived. */
+  reviveDeadLetterJobs(): Promise<number>;
 }
 
 interface JobRow {
@@ -115,6 +121,7 @@ export function createPgQueue(
   let activeBackground = 0;
   const activeJobIds = new Set<string>();
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let deadLetterReviveTimer: ReturnType<typeof setInterval> | null = null;
 
   async function init(): Promise<void> {
     await pool.query(DDL);
@@ -202,6 +209,69 @@ export function createPgQueue(
       changed += 1;
     }
     return changed;
+  }
+
+  // Dead-letter auto-retry (#audit-rate-headroom): a job dies once `attempts >= maxRetries` (see the
+  // max-retries branch in processOne below). Reviving it here only clears `status`/`run_after`/`last_error`
+  // -- `attempts` is left untouched, so it already satisfies `attempts >= maxRetries` and will die again
+  // after exactly ONE more failed attempt, not a fresh full retry budget. The `attempts < ceiling` filter
+  // (ceiling = maxRetries + the configured extra-attempts budget) is what actually bounds how many times a
+  // permanently-broken job can be revived before it stops being a candidate here and requires manual
+  // intervention.
+  async function reviveEligibleDeadJobs(): Promise<number> {
+    const ceiling = maxRetries + queueDeadLetterAutoRetryMaxExtraAttempts();
+    const res = await pool.query(
+      `SELECT id, payload, job_key FROM ${TABLE} WHERE status='dead' AND attempts<$1`,
+      [ceiling],
+    );
+    let revived = 0;
+    const now = Date.now();
+    const maxJitter = queueRecoveryJitterMs();
+    for (const row of res.rows as Array<{ id: string; payload: string; job_key?: string | null }>) {
+      const runAfter = now + deterministicJitterMs(`revive:${row.job_key ?? ""}:${row.id}:${row.payload}`, maxJitter);
+      // AND status='dead' re-checks the row is STILL dead at UPDATE time (mirrors reclaimExpiredProcessingJobs /
+      // deferPendingJobsForRateLimit above) — the SELECT above is a stale snapshot, and without this predicate an
+      // overlapping reviver (another self-host instance, or a slow prior revive tick still running when the next
+      // one fires) could flip a row that's already been claimed into 'processing' back to 'pending', letting it
+      // run a second time concurrently. rowCount is 0 (not counted as revived) when another reviver won the race.
+      const update = await pool.query(
+        `UPDATE ${TABLE} SET status='pending', run_after=$1, last_error=NULL WHERE id=$2 AND status='dead'`,
+        [runAfter, row.id],
+      );
+      revived += update.rowCount ?? 0;
+    }
+    return revived;
+  }
+
+  async function reviveDeadLetterJobs(): Promise<number> {
+    const revived = await reviveEligibleDeadJobs();
+    if (revived) {
+      await recordQueueMetric("gittensory_jobs_dead_letter_revived_total", revived);
+      console.log(JSON.stringify({ event: "selfhost_queue_dead_letter_revived", count: revived }));
+      kickAll();
+    }
+    return revived;
+  }
+
+  /** Wraps reviveDeadLetterJobs() for the setInterval callback below, which has no rejection handler of its
+   *  own -- a transient pool/driver/metric failure here would otherwise surface as an unhandled promise
+   *  rejection and can terminate the process (fatal when SENTRY_DSN is unset, since server.ts only installs
+   *  the handler when Sentry is configured), exactly the failure mode pump()'s own try/catch above guards
+   *  against for the main poll loop. A failed revive tick just waits for the next interval, same as a failed
+   *  poll tick waits for the next poll. */
+  async function reviveDeadLetterJobsSafely(): Promise<void> {
+    try {
+      await reviveDeadLetterJobs();
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          level: "error",
+          event: "selfhost_queue_dead_letter_revive_crashed",
+          error: errorMessageWithCause(error),
+        }),
+      );
+      captureError(error, { kind: "queue_dead_letter_revive_crashed" });
+    }
   }
 
   async function spreadDueJobsOnStartup(): Promise<number> {
@@ -614,10 +684,15 @@ export function createPgQueue(
         timer = setTimeout(tick, pollIntervalMs);
       };
       tick();
+      // Separate, much slower interval than the poll tick above -- reviving a dead job every second would
+      // recreate the retry storm this feature exists to bound. The interval itself is the cooldown between
+      // auto-retry rounds for any one job.
+      deadLetterReviveTimer = setInterval(() => void reviveDeadLetterJobsSafely(), queueDeadLetterReviveIntervalMs());
     },
     async stop() {
       running = false;
       if (timer) clearTimeout(timer);
+      if (deadLetterReviveTimer) clearInterval(deadLetterReviveTimer);
       while (active > 0) await new Promise((r) => setTimeout(r, 10));
     },
     async drain() {
@@ -646,6 +721,7 @@ export function createPgQueue(
       return readQueueStats();
     },
     snapshot: binding.snapshot,
+    reviveDeadLetterJobs,
   };
 
   async function reclaimExpiredProcessingJobs(): Promise<number> {

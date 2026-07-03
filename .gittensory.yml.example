@@ -135,6 +135,14 @@ gate:
     # the gate. Bool. Default: false.
     aiAdvisory: false
 
+  # Oversized-PR gate. A PR at/above BOTH the file-count and line-count thresholds
+  # (engine defaults, not configurable here) gets a manual-review HOLD finding —
+  # never a hard blocker, so it's dry-run/advisory friendly regardless of mode.
+  # off | advisory | block. Default: off. Config-as-code only — no DB column or
+  # dashboard toggle; this can only be set here.
+  size:
+    mode: off
+
   # Composite merge-readiness gate (no min score).
   # off | advisory | block. Default: off.
   mergeReadiness: off
@@ -145,6 +153,19 @@ gate:
   # off | advisory | block. Default: off.
   manifestPolicy: off
 
+  # Self-authored-linked-issue gate — blocks (or advises on) a PR whose only
+  # linked issue was opened by the PR's own author, which the readiness/quality
+  # signals can't otherwise catch. off | advisory | block. Default: advisory.
+  # DB-backed (dashboard-settable too); this overrides the stored value.
+  selfAuthoredLinkedIssue: advisory
+
+  # Gate-wide dry-run. When true, the gate evaluates and posts its verdict as
+  # normal but never actually blocks/merges/closes based on it — useful for
+  # trialing a stricter pack or mode change against real traffic before
+  # enforcing it. Bool. Default: false. Config-as-code only — no DB column or
+  # dashboard toggle; this can only be set here.
+  dryRun: false
+
   # First-time-contributor grace. RESERVED / currently INERT: this value is
   # parsed and stored, but the gate does not read it — a first-time
   # contributor with a real blocker is one-shot closed the same as a
@@ -152,6 +173,24 @@ gate:
   # Setting this to true has no effect today; kept for potential future
   # use. Bool. Default: false.
   firstTimeContributorGrace: false
+
+  # Live premerge migrations/** collision recheck (#2550, anti-abuse-adjacent safety net). When true, a PR
+  # touching migrations/** gets a fresh GitHub read of the base branch's CURRENT migration filenames
+  # immediately before an agent-driven merge (not just at CI time against this PR's own branch snapshot) —
+  # catching the case where a DIFFERENT PR merged a same-numbered migration file in the meantime. A live
+  # collision holds the PR (rebase-needed label + comment) instead of merging blind. Config-as-code only (no
+  # dashboard/DB equivalent). Bool. Default: false. Costs one extra GitHub API call per migrations/**-touching
+  # PR, so it is opt-in rather than a new default.
+  premergeContentRecheck: false
+
+  # Force-rebase-before-merge window in minutes (#2552, anti-race). When the base branch has advanced within
+  # this many minutes of the actual merge-decision moment, an agent-driven merge forces an update_branch +
+  # fresh CI recheck cycle before merging, instead of trusting a mergeable_state: clean read that may already
+  # be stale relative to a sibling commit that just landed on the base. A bounded retry cap prevents a
+  # fast-moving base from live-locking the PR — after a few forced attempts it falls through to a normal
+  # merge with an audit note. Positive integer (minutes), or omit/null. Default: null (never force).
+  # DB-backed (dashboard-settable too); this overrides the stored value.
+  requireFreshRebaseWindow: 10
 
   # AI maintainer review. Opt-in; the AI capabilities are switched on at the
   # deployment level.
@@ -179,6 +218,11 @@ gate:
     # String or null. Default: null (the key record's model, else a conservative
     # per-provider default).
     model: null
+    # Minimum calibrated AI-reviewer confidence (0-1) for a consensus defect to
+    # become a blocker; below this it stays advisory-only. Number 0–1, or null.
+    # Default: null (engine uses 0.93). Config-as-code only — no DB column or
+    # dashboard toggle; this can only be set here.
+    closeConfidence: null
 
 
 # ----------------------------------------------------------------------------
@@ -281,7 +325,7 @@ settings:
   # a dedicated closeIssue primitive lands) with a clear reason. Off by default.
   # reviewNagPolicy: off      # off | hold | close. Default: off.
   # reviewNagMaxPings: 3      # Positive integer. Pings above this within the cooldown window trigger the policy. Default: 3.
-  # reviewNagCooldownDays: 5  # Positive integer. Window the ping count is measured over. Default: 5.
+  # reviewNagCooldownDays: 5  # Positive integer up to 365. Window the ping count is measured over. Default: 5.
   # reviewNagLabel: review-nag-cooldown  # Label applied alongside the hold/close action. Default: review-nag-cooldown.
 
   # Shared repo-scoped exemption list (#2463): GitHub logins never throttled/closed by gittensory's
@@ -289,3 +333,18 @@ settings:
   # above will reuse this list too), on top of the standing owner/admin/automation-bot exemption.
   # List of GitHub logins. Default: [] (no additional exemptions).
   # autoCloseExemptLogins: [some-trusted-regular]
+
+  # Account-age throttle (#2561, anti-abuse): a PR from an account younger than this many days gets
+  # the newAccountLabel below -- friction/visibility only, NEVER an automatic close on account age alone.
+  # Never fires for the repo owner, admin logins, or automation bots. PR-path only. Off by default.
+  # accountAgeThresholdDays: null  # Positive integer, or null/omitted to disable. Default: null (off).
+  # newAccountLabel: new-account  # Label applied to a below-threshold-age account's PR. Default: new-account.
+
+  # Per-command @gittensory rate limit (#2560, anti-abuse): generalizes review-nag's cooldown pattern to
+  # EVERY @gittensory command (help/ask/preflight/blockers/... and the maintainer queue-digest commands),
+  # not just review-request pings — independent of review-nag's own thread-author-only scope. "hold"
+  # replies with a cooldown notice and skips the command's own dispatch. Off by default.
+  # commandRateLimitPolicy: off             # off | hold. Default: off.
+  # commandRateLimitMaxPerWindow: 20        # Positive integer. Per-command invocation limit for a CHEAP command (cache-only, no AI call) within the window. Default: 20.
+  # commandRateLimitAiMaxPerWindow: 5       # Positive integer. Tighter limit for an AI-cost-bearing command (ask/blockers/preflight/reviewability/packet/duplicate-check/next-action/repo-fit). Default: 5.
+  # commandRateLimitWindowHours: 24         # Positive integer. Rolling window (hours) both limits above count against. Default: 24.

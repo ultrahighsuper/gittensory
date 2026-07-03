@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MAX_REVIEW_NAG_COOLDOWN_DAYS } from "../settings/agent-actions";
 import { extendZodWithOpenApi } from "@asteasolutions/zod-to-openapi";
 
 extendZodWithOpenApi(z);
@@ -595,12 +596,23 @@ export const RepositorySettingsSchema = z
     qualityGateMode: z.enum(["off", "advisory", "block"]),
     qualityGateMinScore: z.number().nullable().optional(),
     slopGateMode: z.enum(["off", "advisory", "block"]),
+    sizeGateMode: z.enum(["off", "advisory", "block"]).optional(),
+    gateDryRun: z.boolean().optional(),
+    premergeContentRecheck: z.boolean().optional(),
+    requireFreshRebaseWindowMinutes: z.number().int().positive().nullable().optional(),
     mergeReadinessGateMode: z.enum(["off", "advisory", "block"]),
     manifestPolicyGateMode: z.enum(["off", "advisory", "block"]),
     selfAuthoredLinkedIssueGateMode: z.enum(["off", "advisory", "block"]),
     firstTimeContributorGrace: z.boolean(),
     slopGateMinScore: z.number().nullable().optional(),
     slopAiAdvisory: z.boolean(),
+    aiReviewMode: z.enum(["off", "advisory", "block"]),
+    aiReviewByok: z.boolean(),
+    aiReviewProvider: z.enum(["anthropic", "openai"]).nullable().optional(),
+    aiReviewModel: z.string().nullable().optional(),
+    aiReviewAllAuthors: z.boolean(),
+    aiReviewCloseConfidence: z.number().nullable().optional(),
+    closeOwnerAuthors: z.boolean(),
     autoLabelEnabled: z.boolean(),
     gittensorLabel: z.string(),
     blacklistLabel: z.string(),
@@ -610,6 +622,7 @@ export const RepositorySettingsSchema = z
     requireLinkedIssue: z.boolean(),
     backfillEnabled: z.boolean(),
     privateTrustEnabled: z.boolean(),
+    badgeEnabled: z.boolean().optional(),
     commandAuthorization: z.object({
       default: z.array(z.enum(["maintainer", "collaborator", "pr_author", "confirmed_miner"])),
       commands: z.record(z.string(), z.array(z.enum(["maintainer", "collaborator", "pr_author", "confirmed_miner"]))),
@@ -635,9 +648,15 @@ export const RepositorySettingsSchema = z
     contributorCapLabel: z.string().optional(),
     reviewNagPolicy: z.enum(["off", "hold", "close"]).optional(),
     reviewNagMaxPings: z.number().int().positive().optional(),
-    reviewNagCooldownDays: z.number().int().positive().optional(),
+    reviewNagCooldownDays: z.number().int().positive().max(MAX_REVIEW_NAG_COOLDOWN_DAYS).optional(),
     reviewNagLabel: z.string().optional(),
     autoCloseExemptLogins: z.array(z.string()).optional(),
+    accountAgeThresholdDays: z.number().int().positive().nullable().optional(),
+    newAccountLabel: z.string().optional(),
+    commandRateLimitPolicy: z.enum(["off", "hold"]).optional(),
+    commandRateLimitMaxPerWindow: z.number().int().positive().optional(),
+    commandRateLimitAiMaxPerWindow: z.number().int().positive().optional(),
+    commandRateLimitWindowHours: z.number().int().positive().optional(),
     createdAt: z.string().nullable().optional(),
     updatedAt: z.string().nullable().optional(),
   })
@@ -672,6 +691,12 @@ export const RepoSettingsPreviewSchema = z
       createMissingLabel: z.boolean(),
       includeMaintainerAuthors: z.boolean(),
       requireLinkedIssue: z.boolean(),
+      badgeEnabled: z.boolean(),
+      aiReviewMode: z.enum(["off", "advisory", "block"]),
+      aiReviewByok: z.boolean(),
+      aiReviewProvider: z.string().nullable(),
+      aiReviewModel: z.string().nullable(),
+      aiReviewAllAuthors: z.boolean(),
       commandAuthorization: z.object({
         defaultAllowed: z.array(z.enum(["maintainer", "collaborator", "pr_author", "confirmed_miner"])),
         commandOverrides: z.array(

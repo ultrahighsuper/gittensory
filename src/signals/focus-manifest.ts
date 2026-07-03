@@ -45,6 +45,21 @@ export type FocusManifestGateConfig = {
   selfAuthoredLinkedIssue: GateRuleMode | null;
   dryRun: boolean | null;
   firstTimeContributorGrace: boolean | null;
+  /** `gate.premergeContentRecheck` (#2550): for a PR touching `migrations/**`, re-verify against a live,
+   *  freshly-fetched tip of the base branch — unioned with this PR's own new migration filenames — for a
+   *  migration-number collision immediately before an agent-driven merge, not just at CI time against the
+   *  PR's own stale branch snapshot. On a live collision, the merge is suppressed and the PR is held with a
+   *  rebase-needed comment instead of merging blind. null (unset) ⇒ off (byte-identical to today) — this
+   *  costs one extra, uncached GitHub Trees-API call for any PR that touches migrations/**, so it is opt-in
+   *  rather than a new default. */
+  premergeContentRecheck: boolean | null;
+  /** `gate.requireFreshRebaseWindow` (#2552, anti-race): minutes. When the base branch has advanced within
+   *  this window of the actual merge-decision moment, an agent-driven merge forces an `update_branch` +
+   *  fresh CI recheck cycle before merging, instead of trusting a `mergeableState: clean` read that may
+   *  already be stale relative to a sibling commit that just landed on the base. null (unset) ⇒ never force
+   *  (byte-identical to today) — a discrete positive-minutes count, not a score, so it is neither clamped
+   *  nor rounded; an invalid value (fractional, non-positive, non-finite) is dropped with a warning. */
+  requireFreshRebaseWindowMinutes: number | null;
 };
 
 // The converged per-PR review features a self-host operator toggles PER-REPO under `features:` in the private
@@ -112,6 +127,7 @@ export type FocusManifestSettings = Partial<
     | "aiReviewAllAuthors"
     | "closeOwnerAuthors"
     | "autoLabelEnabled"
+    | "badgeEnabled"
     | "gittensorLabel"
     | "createMissingLabel"
     | "publicSurface"
@@ -134,6 +150,12 @@ export type FocusManifestSettings = Partial<
     | "reviewNagCooldownDays"
     | "reviewNagLabel"
     | "autoCloseExemptLogins"
+    | "accountAgeThresholdDays"
+    | "newAccountLabel"
+    | "commandRateLimitPolicy"
+    | "commandRateLimitMaxPerWindow"
+    | "commandRateLimitAiMaxPerWindow"
+    | "commandRateLimitWindowHours"
   >
 >;
 
@@ -292,6 +314,8 @@ const EMPTY_GATE_CONFIG: FocusManifestGateConfig = {
   selfAuthoredLinkedIssue: null,
   dryRun: null,
   firstTimeContributorGrace: null,
+  premergeContentRecheck: null,
+  requireFreshRebaseWindowMinutes: null,
 };
 
 const EMPTY_FEATURES_CONFIG: FocusManifestFeaturesConfig = {
@@ -408,7 +432,10 @@ function normalizeSource(raw: FocusManifestSource | undefined, value: JsonValue 
 
 function normalizeOptionalGateMode(value: JsonValue | undefined, field: string, warnings: string[]): GateRuleMode | null {
   if (value === undefined || value === null) return null;
-  if (value === "off" || value === "advisory" || value === "block") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "off" || normalized === "advisory" || normalized === "block") return normalized;
+  }
   warnings.push(`Manifest gate field "${field}" must be one of off, advisory, block; ignoring "${String(value)}".`);
   return null;
 }
@@ -510,6 +537,8 @@ function parseGateConfig(value: JsonValue | undefined, warnings: string[]): Focu
     selfAuthoredLinkedIssue: normalizeOptionalGateMode(record.selfAuthoredLinkedIssue, "gate.selfAuthoredLinkedIssue", warnings),
     dryRun: normalizeOptionalBoolean(record.dryRun, "gate.dryRun", warnings),
     firstTimeContributorGrace: normalizeOptionalBoolean(record.firstTimeContributorGrace, "gate.firstTimeContributorGrace", warnings),
+    premergeContentRecheck: normalizeOptionalBoolean(record.premergeContentRecheck, "gate.premergeContentRecheck", warnings),
+    requireFreshRebaseWindowMinutes: normalizeOptionalPositiveInteger(record.requireFreshRebaseWindow, "gate.requireFreshRebaseWindow", warnings),
   };
   // #2266: the flag is parsed, clamped, and threaded end-to-end, but the gate evaluator never reads it — a
   // maintainer who sets it to true believing it softens a blocker for newcomers gets no such effect. Surface
@@ -539,7 +568,9 @@ function parseGateConfig(value: JsonValue | undefined, warnings: string[]): Focu
     gate.manifestPolicy !== null ||
     gate.selfAuthoredLinkedIssue !== null ||
     gate.dryRun !== null ||
-    gate.firstTimeContributorGrace !== null;
+    gate.firstTimeContributorGrace !== null ||
+    gate.premergeContentRecheck !== null ||
+    gate.requireFreshRebaseWindowMinutes !== null;
   return gate;
 }
 
@@ -583,6 +614,8 @@ export function gateConfigToJson(gate: FocusManifestGateConfig): JsonValue {
   if (gate.selfAuthoredLinkedIssue !== null) out.selfAuthoredLinkedIssue = gate.selfAuthoredLinkedIssue;
   if (gate.dryRun !== null) out.dryRun = gate.dryRun;
   if (gate.firstTimeContributorGrace !== null) out.firstTimeContributorGrace = gate.firstTimeContributorGrace;
+  if (gate.premergeContentRecheck !== null) out.premergeContentRecheck = gate.premergeContentRecheck;
+  if (gate.requireFreshRebaseWindowMinutes !== null) out.requireFreshRebaseWindow = gate.requireFreshRebaseWindowMinutes;
   return out;
 }
 
@@ -712,6 +745,13 @@ function normalizeOptionalString(value: JsonValue | undefined, field: string, wa
   return null;
 }
 
+// Keep the review-nag lookback operationally bounded so repo-controlled config cannot overflow Date
+// arithmetic. Duplicated from settings/agent-actions.ts's own MAX_REVIEW_NAG_COOLDOWN_DAYS (same value,
+// same rationale) rather than imported: this module is part of the UI package's typechecked closure, and
+// agent-actions.ts transitively imports github/commands.ts -> utils/crypto.ts, pulling a heavier
+// GitHub-App-specific dependency chain into the UI build for one small constant.
+const MAX_REVIEW_NAG_COOLDOWN_DAYS = 365;
+
 /**
  * Parse the optional `settings:` mapping — a partial repository-settings override. Only recognized
  * fields are kept; unknown/invalid values are dropped with a warning and never throw.
@@ -761,7 +801,7 @@ function parseSettingsOverride(value: JsonValue | undefined, warnings: string[])
   if (blacklistLabel !== null) out.blacklistLabel = blacklistLabel;
   const publicSurface = normalizeOptionalEnum(r.publicSurface, "settings.publicSurface", ["off", "comment_and_label", "comment_only", "label_only"] as const, warnings);
   if (publicSurface !== null) out.publicSurface = publicSurface;
-  for (const key of ["aiReviewByok", "aiReviewAllAuthors", "closeOwnerAuthors", "autoLabelEnabled", "createMissingLabel", "includeMaintainerAuthors", "requireLinkedIssue", "backfillEnabled", "privateTrustEnabled", "agentPaused", "agentDryRun"] as const) {
+  for (const key of ["aiReviewByok", "aiReviewAllAuthors", "closeOwnerAuthors", "autoLabelEnabled", "badgeEnabled", "createMissingLabel", "includeMaintainerAuthors", "requireLinkedIssue", "backfillEnabled", "privateTrustEnabled", "agentPaused", "agentDryRun"] as const) {
     const flag = normalizeOptionalBoolean(r[key], `settings.${key}`, warnings);
     if (flag !== null) out[key] = flag;
   }
@@ -830,7 +870,10 @@ function parseSettingsOverride(value: JsonValue | undefined, warnings: string[])
   const reviewNagMaxPings = normalizeOptionalPositiveInteger(r.reviewNagMaxPings, "settings.reviewNagMaxPings", warnings);
   if (reviewNagMaxPings !== null) out.reviewNagMaxPings = reviewNagMaxPings;
   const reviewNagCooldownDays = normalizeOptionalPositiveInteger(r.reviewNagCooldownDays, "settings.reviewNagCooldownDays", warnings);
-  if (reviewNagCooldownDays !== null) out.reviewNagCooldownDays = reviewNagCooldownDays;
+  if (reviewNagCooldownDays !== null && reviewNagCooldownDays <= MAX_REVIEW_NAG_COOLDOWN_DAYS) out.reviewNagCooldownDays = reviewNagCooldownDays;
+  if (reviewNagCooldownDays !== null && reviewNagCooldownDays > MAX_REVIEW_NAG_COOLDOWN_DAYS) {
+    warnings.push(`Manifest field "settings.reviewNagCooldownDays" must be at most ${MAX_REVIEW_NAG_COOLDOWN_DAYS}; ignoring it.`);
+  }
   const reviewNagLabel = normalizeOptionalString(r.reviewNagLabel, "settings.reviewNagLabel", warnings);
   if (reviewNagLabel !== null) out.reviewNagLabel = reviewNagLabel;
   // Shared repo-scoped exemption list (#2463): only set it when at least one VALID login survives
@@ -840,6 +883,25 @@ function parseSettingsOverride(value: JsonValue | undefined, warnings: string[])
     warnings.push(...exemptWarnings);
     if (logins.length > 0) out.autoCloseExemptLogins = logins;
   }
+  // Account-age throttle (#2561): an explicit yml `null` is load-bearing (clears a DB-configured threshold
+  // back to "off"), matching contributorOpenPrCap's own null-vs-omitted distinction above.
+  if (r.accountAgeThresholdDays === null) {
+    out.accountAgeThresholdDays = null;
+  } else {
+    const accountAgeThresholdDays = normalizeOptionalPositiveInteger(r.accountAgeThresholdDays, "settings.accountAgeThresholdDays", warnings);
+    if (accountAgeThresholdDays !== null) out.accountAgeThresholdDays = accountAgeThresholdDays;
+  }
+  const newAccountLabel = normalizeOptionalString(r.newAccountLabel, "settings.newAccountLabel", warnings);
+  if (newAccountLabel !== null) out.newAccountLabel = newAccountLabel;
+  // Per-command @gittensory rate limit (#2560): generalizes review-nag's cooldown pattern to every command.
+  const commandRateLimitPolicy = normalizeOptionalEnum(r.commandRateLimitPolicy, "settings.commandRateLimitPolicy", ["off", "hold"] as const, warnings);
+  if (commandRateLimitPolicy !== null) out.commandRateLimitPolicy = commandRateLimitPolicy;
+  const commandRateLimitMaxPerWindow = normalizeOptionalPositiveInteger(r.commandRateLimitMaxPerWindow, "settings.commandRateLimitMaxPerWindow", warnings);
+  if (commandRateLimitMaxPerWindow !== null) out.commandRateLimitMaxPerWindow = commandRateLimitMaxPerWindow;
+  const commandRateLimitAiMaxPerWindow = normalizeOptionalPositiveInteger(r.commandRateLimitAiMaxPerWindow, "settings.commandRateLimitAiMaxPerWindow", warnings);
+  if (commandRateLimitAiMaxPerWindow !== null) out.commandRateLimitAiMaxPerWindow = commandRateLimitAiMaxPerWindow;
+  const commandRateLimitWindowHours = normalizeOptionalPositiveInteger(r.commandRateLimitWindowHours, "settings.commandRateLimitWindowHours", warnings);
+  if (commandRateLimitWindowHours !== null) out.commandRateLimitWindowHours = commandRateLimitWindowHours;
   return out;
 }
 
@@ -1194,6 +1256,8 @@ export function resolveEffectiveSettings(
   if (gate.selfAuthoredLinkedIssue !== null) effective.selfAuthoredLinkedIssueGateMode = gate.selfAuthoredLinkedIssue;
   if (gate.dryRun !== null) effective.gateDryRun = gate.dryRun;
   if (gate.firstTimeContributorGrace !== null) effective.firstTimeContributorGrace = gate.firstTimeContributorGrace;
+  if (gate.premergeContentRecheck !== null) effective.premergeContentRecheck = gate.premergeContentRecheck;
+  if (gate.requireFreshRebaseWindowMinutes !== null) effective.requireFreshRebaseWindowMinutes = gate.requireFreshRebaseWindowMinutes;
   // The dashboard "Require linked issue" toggle must not silently diverge from gate blocking: when the
   // boolean is on but linkedIssueGateMode is still off, treat it as a block requirement (#797).
   if (effective.requireLinkedIssue && effective.linkedIssueGateMode === "off") {

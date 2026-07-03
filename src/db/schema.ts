@@ -99,6 +99,19 @@ export const repositorySettings = sqliteTable("repository_settings", {
   reviewNagLabel: text("review_nag_label").notNull().default("review-nag-cooldown"),
   // Shared repo-scoped exemption list (#2463): a JSON array of GitHub logins.
   autoCloseExemptLoginsJson: text("auto_close_exempt_logins_json").notNull().default("[]"),
+  // Force-rebase-before-merge window in minutes (#2552): null = never force (default). Enforcement lands in
+  // runAgentMaintenancePlanAndExecute, not here.
+  requireFreshRebaseWindowMinutes: integer("require_fresh_rebase_window_minutes"),
+  // Account-age throttle (#2561, anti-abuse): null = off (default). Enforcement lands in
+  // runAgentMaintenancePlanAndExecute, not here.
+  accountAgeThresholdDays: integer("account_age_threshold_days"),
+  newAccountLabel: text("new_account_label").notNull().default("new-account"),
+  // Per-command @gittensory rate limit (#2560, anti-abuse): generalizes review-nag's cooldown pattern to every
+  // command, keyed by (actor, command, targetKey) independent of review-nag's own thread-author-only scope.
+  commandRateLimitPolicy: text("command_rate_limit_policy").notNull().default("off"),
+  commandRateLimitMaxPerWindow: integer("command_rate_limit_max_per_window").notNull().default(20),
+  commandRateLimitAiMaxPerWindow: integer("command_rate_limit_ai_max_per_window").notNull().default(5),
+  commandRateLimitWindowHours: integer("command_rate_limit_window_hours").notNull().default(24),
   createdAt: text("created_at").notNull().$defaultFn(() => nowIso()),
   updatedAt: text("updated_at").notNull().$defaultFn(() => nowIso()),
 });
@@ -228,9 +241,23 @@ export const pullRequestDetailSyncState = sqliteTable(
     headSha: text("head_sha"),
     filesSyncedAt: text("files_synced_at"),
     reviewsSyncedAt: text("reviews_synced_at"),
+    // Bumped by a `pull_request_review` webhook (submitted/dismissed/edited) to signal the cached reviews are
+    // stale. NULL, or a value <= reviewsSyncedAt, means the last sync already covers every invalidating event,
+    // so fetchAndStorePullRequestDetails can skip the `GET /pulls/{n}/reviews` call. Reviews are independent of
+    // headSha (a new commit alone does not invalidate existing review state; only an actual review-webhook event
+    // does) -- unlike the files cache, which is why this uses its own timestamp column instead of headSha matching.
+    reviewsInvalidatedAt: text("reviews_invalidated_at"),
     checksSyncedAt: text("checks_synced_at"),
     lastSyncedAt: text("last_synced_at"),
     errorSummary: text("error_summary"),
+    // Durable bare-PR-state cache (#2537): mirrors GET /pulls/{n}'s mutable state/mergeable_state, refreshed on
+    // synchronize/closed/reopened webhooks and read by the freshness-guard/readiness/dup-winner call sites that
+    // don't need a live-recompute guarantee. NEVER read by the act-boundary merge/close decision
+    // (planAgentMaintenanceActions / the unified-comment mirror) or by resolveOverrideHeadSha (gate-override) --
+    // both intentionally force a live read immediately before acting.
+    prMergeableState: text("pr_mergeable_state"),
+    prState: text("pr_state"),
+    prStateFetchedAt: text("pr_state_fetched_at"),
     updatedAt: text("updated_at").notNull().$defaultFn(() => nowIso()),
   },
   (table) => ({

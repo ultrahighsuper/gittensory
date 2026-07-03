@@ -124,6 +124,11 @@
     // reviewed repos. Flag-OFF the endpoint 404s and the homepage band renders nothing (counts only, no PR
     // content/authors/scores/rewards). See src/review/public-stats.ts.
     "GITTENSORY_PUBLIC_STATS": "true",
+    // Proof of Power (#1059): the own-ledger allowlist for the public stats counter (DELIBERATELY separate from
+    // GITTENSORY_REVIEW_REPOS above, which went empty when these repos' LIVE processing moved to self-host — see
+    // src/env.d.ts for the full split rationale). These three repos' historical audit_events rows remain real and
+    // safe to publish even though the cutover allowlist above no longer lists them.
+    "GITTENSORY_PUBLIC_STATS_REPOS": "JSONbored/gittensory,JSONbored/awesome-claude,JSONbored/metagraphed",
     // Duplicate-winner adjudication (#dup-winner): when a same-issue cluster of OPEN PRs forms, spare exactly
     // ONE winner — the lowest-numbered (earliest opened) open PR — instead of blocking/closing every sibling.
     // Only the LOSERS get the duplicate blocker + close reason + slop penalty + panel block; the winner is
@@ -132,6 +137,11 @@
     // #1695 both closed) — the opposite of "spare one good PR". With it ON, the earliest open PR in a cluster
     // is judged on its merits and only the true duplicates close.
     "GITTENSORY_DUPLICATE_WINNER": "true",
+    // Open-PR file-path collision (#2653): enrich changedFiles on the reviewed PR and its open siblings from
+    // the pull_request_files cache before building the collision report, so two independently-open PRs on the
+    // same file get flagged the way two title-similar PRs already are. Default OFF — unset/false leaves every
+    // PullRequestRecord's changedFiles unset (byte-identical to today, no extra D1 reads).
+    "GITTENSORY_OPEN_PR_FILE_COLLISION": "false",
   },
   "routes": [
     {

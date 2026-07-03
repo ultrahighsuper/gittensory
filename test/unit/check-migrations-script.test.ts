@@ -9,6 +9,12 @@ afterEach(() => {
   for (const dir of tmpDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
+// #2550: the script imports src/db/migration-collisions.ts (a .ts module), so it must be run via `tsx` (the
+// same binary package.json's db:migrations:check uses) rather than plain `node` — a bare `node.execPath`
+// invocation can't resolve the .ts import without an experimental flag CI's pinned Node isn't guaranteed to
+// support.
+const TSX_BIN = join(process.cwd(), "node_modules", ".bin", "tsx");
+
 // Run scripts/check-migrations.mjs over a throwaway fixture dir (via CHECK_MIGRATIONS_DIR) and normalize the
 // pass/fail into { status, out }. On a non-zero exit execFileSync throws; the violation text is on stderr.
 function runCheck(files: Record<string, string>): { status: number; out: string } {
@@ -16,7 +22,7 @@ function runCheck(files: Record<string, string>): { status: number; out: string 
   tmpDirs.push(dir);
   for (const [name, body] of Object.entries(files)) writeFileSync(join(dir, name), body);
   try {
-    const stdout = execFileSync(process.execPath, ["scripts/check-migrations.mjs"], {
+    const stdout = execFileSync(TSX_BIN, ["scripts/check-migrations.mjs"], {
       encoding: "utf8",
       env: { ...process.env, CHECK_MIGRATIONS_DIR: dir },
     });
@@ -29,7 +35,7 @@ function runCheck(files: Record<string, string>): { status: number; out: string 
 
 describe("check-migrations script", () => {
   it("reports every grandfathered duplicate migration number in the success summary", () => {
-    const output = execFileSync(process.execPath, ["scripts/check-migrations.mjs"], { encoding: "utf8" });
+    const output = execFileSync(TSX_BIN, ["scripts/check-migrations.mjs"], { encoding: "utf8" });
 
     expect(output).toContain("(4 grandfathered duplicates: 0015, 0017, 0074, 0090)");
   });
@@ -127,4 +133,39 @@ describe("check-migrations script", () => {
       expect(r.out).toContain("1 migrations OK");
     },
   );
+
+  // #2551: two DIFFERENT, individually-valid migration numbers adding the SAME column to the SAME table.
+  it("rejects two migrations that independently add the same column to the same table", () => {
+    const r = runCheck({
+      "0001_a.sql": "CREATE TABLE widgets (id INTEGER PRIMARY KEY);\n",
+      "0002_b.sql": "ALTER TABLE widgets ADD COLUMN color TEXT;\n",
+      "0003_c.sql": "ALTER TABLE widgets ADD COLUMN color TEXT;\n",
+    });
+
+    expect(r.status).toBe(1);
+    expect(r.out).toContain("duplicate column widgets.color");
+    expect(r.out).toContain('"0002_b.sql"');
+    expect(r.out).toContain('"0003_c.sql"');
+  });
+
+  it("does not flag a DROP TABLE + CREATE TABLE recreate as colliding with the table it replaces", () => {
+    const r = runCheck({
+      "0001_a.sql": "CREATE TABLE widgets (id INTEGER, old_col TEXT);\n",
+      "0002_b.sql": "DROP TABLE IF EXISTS widgets;\nCREATE TABLE widgets (id INTEGER, new_col TEXT);\n",
+    });
+
+    expect(r.status).toBe(0);
+    expect(r.out).toContain("2 migrations OK");
+  });
+
+  it("passes cleanly when two migrations touch the same table with different columns", () => {
+    const r = runCheck({
+      "0001_a.sql": "CREATE TABLE widgets (id INTEGER PRIMARY KEY);\n",
+      "0002_b.sql": "ALTER TABLE widgets ADD COLUMN color TEXT;\n",
+      "0003_c.sql": "ALTER TABLE widgets ADD COLUMN size TEXT;\n",
+    });
+
+    expect(r.status).toBe(0);
+    expect(r.out).toContain("3 migrations OK");
+  });
 });

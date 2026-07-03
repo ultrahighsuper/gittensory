@@ -18,6 +18,8 @@ import {
   getInstallation,
   getLatestUpstreamRulesetSnapshot,
   getPullRequest,
+  getPullRequestDetailSyncState,
+  upsertPullRequestDetailSyncState,
   getRepository,
   listUpstreamDriftReports,
   listInstallationHealth,
@@ -45,7 +47,8 @@ import {
   upsertRepositoryFromGitHub,
   putCachedAiReview,
 } from "../../src/db/repositories";
-import { agentMaintenanceHeadMatchesGate, changedPathsForGuardrail, claimAiReviewLock, claimPrActuationLock, contributorEvidenceBatchSize, processJob, releaseAiReviewLock, releasePrActuationLock } from "../../src/queue/processors";
+import { agentMaintenanceHeadMatchesGate, changedPathsForGuardrail, claimAiReviewLock, claimPrActuationLock, contributorEvidenceBatchSize, enrichOpenPullRequestsWithChangedFiles, processJob, reconcileLiveDuplicateSiblings, releaseAiReviewLock, releasePrActuationLock } from "../../src/queue/processors";
+import type { PullRequestRecord } from "../../src/types";
 import { aiReviewCacheInputFingerprint } from "../../src/review/ai-review-cache-input";
 import { upsertRepoFocusManifest } from "../../src/signals/focus-manifest-loader";
 import { normalizeRegistryPayload } from "../../src/registry/normalize";
@@ -1001,6 +1004,9 @@ describe("queue processors", () => {
     await upsertRepositoryFromGitHub(env, { name: "agent-repo", full_name: "owner/agent-repo", private: false, owner: { login: "owner" } }, 9001);
     await upsertRepositorySettings(env, { repoFullName: "owner/agent-repo", autonomy: { merge: "auto", update_branch: "auto" }, autoMaintain: { requireApprovals: 0, mergeMethod: "squash" }, aiReviewMode: "off", gatePack: "oss-anti-slop", gateCheckMode: "enabled", checkRunMode: "off", commentMode: "off", publicSurface: "off" });
     await upsertPullRequestFromGitHub(env, "owner/agent-repo", { number: 7, title: "Clean PR", state: "open", user: { login: "contributor" }, head: { sha: "a7" }, base: { ref: "main" }, labels: [], body: "Closes #1" });
+    // Seed an UP-TO-DATE reviews-cache marker so this dedup-focused call-count test stays isolated from the
+    // reviews-staleness self-heal (#2537 follow-up) — that behavior has its own dedicated coverage below.
+    await upsertPullRequestDetailSyncState(env, { repoFullName: "owner/agent-repo", pullNumber: 7, status: "complete", reviewsSyncedAt: new Date().toISOString() });
     let barePullGets = 0;
     let branchProtectionGets = 0;
     let liveCheckRunsGets = 0;
@@ -1070,6 +1076,131 @@ describe("queue processors", () => {
     expect(liveCheckRunsGets).toBe(2);
     expect(statusGets).toBe(2);
     expect(mergeAttempts).toBe(0);
+  });
+
+  it("REGRESSION (#2537 follow-up): the per-PR sweep unit force-refreshes a STALE reviews cache even when no OTHER reason (slop evidence, manifest gate, pre-merge check paths) would have triggered a refresh", async () => {
+    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+    await upsertInstallation(env, { action: "created", installation: { id: 9001, account: { login: "owner", id: 1, type: "Organization" }, target_type: "Organization", repository_selection: "selected", permissions: { pull_requests: "write" }, events: [] } });
+    await upsertRepositoryFromGitHub(env, { name: "agent-repo", full_name: "owner/agent-repo", private: false, owner: { login: "owner" } }, 9001);
+    await upsertRepositorySettings(env, { repoFullName: "owner/agent-repo", autonomy: { merge: "auto", update_branch: "auto" }, autoMaintain: { requireApprovals: 0, mergeMethod: "squash" }, aiReviewMode: "off", gatePack: "oss-anti-slop", gateCheckMode: "enabled", checkRunMode: "off", commentMode: "off", publicSurface: "off" });
+    await upsertPullRequestFromGitHub(env, "owner/agent-repo", { number: 7, title: "Clean PR", state: "open", user: { login: "contributor" }, head: { sha: "a7" }, base: { ref: "main" }, labels: [], body: "Closes #1" });
+    // A sync that predates an invalidation (STALE) and no other refresh trigger in play (slop evidence off,
+    // manifest gate off, no pre-merge check paths configured) — proves the sweep's own visit, not some unrelated
+    // setting, is what converges the stale reviews cache.
+    await upsertPullRequestDetailSyncState(env, {
+      repoFullName: "owner/agent-repo",
+      pullNumber: 7,
+      status: "complete",
+      reviewsSyncedAt: "2026-05-01T00:00:00.000Z",
+      reviewsInvalidatedAt: "2026-05-02T00:00:00.000Z",
+    });
+    let reviewsGets = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.includes("/access_tokens")) return Response.json({ token: "fake-installation-token" });
+      if (/\/pulls\/7(?:\?|$)/.test(url) && method === "GET") {
+        return Response.json({ number: 7, title: "Clean PR", state: "open", user: { login: "contributor" }, head: { sha: "a7" }, mergeable_state: "clean", labels: [], body: "Closes #1" });
+      }
+      if (url.includes("/pulls/7/files")) return Response.json([]);
+      if (url.includes("/pulls/7/reviews")) {
+        reviewsGets += 1;
+        return Response.json([]);
+      }
+      if (url.includes("/commits/a7/check-runs")) return Response.json({ total_count: 0, check_runs: [] });
+      if (url.includes("/commits/a7/status")) return Response.json({ state: "success", statuses: [] });
+      if (url.includes("/issues/1")) return Response.json({ number: 1, title: "Issue", state: "open", labels: [], user: { login: "reporter" } });
+      if (url.includes("/branches/")) return Response.json({ protected: false, protection: { required_status_checks: { contexts: [] } } });
+      return Response.json({});
+    });
+    vi.setSystemTime(new Date("2026-05-28T02:00:00.000Z"));
+
+    await processJob(env, { type: "agent-regate-pr", deliveryId: "reviews-stale-selfheal", repoFullName: "owner/agent-repo", prNumber: 7, installationId: 9001 });
+
+    expect(reviewsGets).toBeGreaterThan(0);
+  });
+
+  it("REGRESSION (#2537 second pass): a SILENTLY DROPPED invalidation write (reviewsInvalidatedAt stays null forever) still self-heals via the bounded-age backstop", async () => {
+    // The invalidation-marker comparison alone (isReviewsCacheUpToDate) reads "up to date" forever when
+    // markPullRequestReviewsInvalidated's write is dropped -- there is no marker to compare a sync timestamp
+    // against. Only a bounded-age fallback, independent of the marker, can catch this: an old enough
+    // reviewsSyncedAt with NO invalidation recorded at all must still be treated as stale.
+    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+    await upsertInstallation(env, { action: "created", installation: { id: 9001, account: { login: "owner", id: 1, type: "Organization" }, target_type: "Organization", repository_selection: "selected", permissions: { pull_requests: "write" }, events: [] } });
+    await upsertRepositoryFromGitHub(env, { name: "agent-repo", full_name: "owner/agent-repo", private: false, owner: { login: "owner" } }, 9001);
+    await upsertRepositorySettings(env, { repoFullName: "owner/agent-repo", autonomy: { merge: "auto", update_branch: "auto" }, autoMaintain: { requireApprovals: 0, mergeMethod: "squash" }, aiReviewMode: "off", gatePack: "oss-anti-slop", gateCheckMode: "enabled", checkRunMode: "off", commentMode: "off", publicSurface: "off" });
+    await upsertPullRequestFromGitHub(env, "owner/agent-repo", { number: 8, title: "Clean PR", state: "open", user: { login: "contributor" }, head: { sha: "a8" }, base: { ref: "main" }, labels: [], body: "Closes #1" });
+    // No reviewsInvalidatedAt at all -- the marker comparison alone would read this as permanently up to date.
+    await upsertPullRequestDetailSyncState(env, {
+      repoFullName: "owner/agent-repo",
+      pullNumber: 8,
+      status: "complete",
+      reviewsSyncedAt: "2026-05-01T00:00:00.000Z",
+    });
+    let reviewsGets = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.includes("/access_tokens")) return Response.json({ token: "fake-installation-token" });
+      if (/\/pulls\/8(?:\?|$)/.test(url) && method === "GET") {
+        return Response.json({ number: 8, title: "Clean PR", state: "open", user: { login: "contributor" }, head: { sha: "a8" }, mergeable_state: "clean", labels: [], body: "Closes #1" });
+      }
+      if (url.includes("/pulls/8/files")) return Response.json([]);
+      if (url.includes("/pulls/8/reviews")) {
+        reviewsGets += 1;
+        return Response.json([]);
+      }
+      if (url.includes("/commits/a8/check-runs")) return Response.json({ total_count: 0, check_runs: [] });
+      if (url.includes("/commits/a8/status")) return Response.json({ state: "success", statuses: [] });
+      if (url.includes("/issues/1")) return Response.json({ number: 1, title: "Issue", state: "open", labels: [], user: { login: "reporter" } });
+      if (url.includes("/branches/")) return Response.json({ protected: false, protection: { required_status_checks: { contexts: [] } } });
+      return Response.json({});
+    });
+    // Far past the 48h bounded-age backstop, well past the 2026-05-01 sync stamp.
+    vi.setSystemTime(new Date("2026-05-28T02:00:00.000Z"));
+
+    await processJob(env, { type: "agent-regate-pr", deliveryId: "reviews-dropped-invalidation-selfheal", repoFullName: "owner/agent-repo", prNumber: 8, installationId: 9001 });
+
+    expect(reviewsGets).toBeGreaterThan(0);
+  });
+
+  it("REGRESSION (#2537 follow-up): a failed read of the reviews-cache sync state fails OPEN — the sweep completes without crashing rather than propagating the D1 error", async () => {
+    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+    await upsertInstallation(env, { action: "created", installation: { id: 9001, account: { login: "owner", id: 1, type: "Organization" }, target_type: "Organization", repository_selection: "selected", permissions: { pull_requests: "write" }, events: [] } });
+    await upsertRepositoryFromGitHub(env, { name: "agent-repo", full_name: "owner/agent-repo", private: false, owner: { login: "owner" } }, 9001);
+    await upsertRepositorySettings(env, { repoFullName: "owner/agent-repo", autonomy: { merge: "auto", update_branch: "auto" }, autoMaintain: { requireApprovals: 0, mergeMethod: "squash" }, aiReviewMode: "off", gatePack: "oss-anti-slop", gateCheckMode: "enabled", checkRunMode: "off", commentMode: "off", publicSurface: "off" });
+    await upsertPullRequestFromGitHub(env, "owner/agent-repo", { number: 7, title: "Clean PR", state: "open", user: { login: "contributor" }, head: { sha: "a7" }, base: { ref: "main" }, labels: [], body: "Closes #1" });
+    await upsertPullRequestDetailSyncState(env, { repoFullName: "owner/agent-repo", pullNumber: 7, status: "complete", reviewsSyncedAt: new Date().toISOString() });
+    // mockRejectedValue (not -Once): an earlier getPullRequestDetailSyncState read inside the resync/readiness
+    // path runs before this function's own read, so a single -Once rejection could be consumed there instead.
+    const syncStateSpy = vi.spyOn(repositoriesModule, "getPullRequestDetailSyncState").mockRejectedValue(new Error("D1 read failed"));
+    let reviewsGets = 0;
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.includes("/access_tokens")) return Response.json({ token: "fake-installation-token" });
+      if (/\/pulls\/7(?:\?|$)/.test(url) && method === "GET") {
+        return Response.json({ number: 7, title: "Clean PR", state: "open", user: { login: "contributor" }, head: { sha: "a7" }, mergeable_state: "clean", labels: [], body: "Closes #1" });
+      }
+      if (url.includes("/pulls/7/files")) return Response.json([]);
+      if (url.includes("/pulls/7/reviews")) {
+        reviewsGets += 1;
+        return Response.json([]);
+      }
+      if (url.includes("/commits/a7/check-runs")) return Response.json({ total_count: 0, check_runs: [] });
+      if (url.includes("/commits/a7/status")) return Response.json({ state: "success", statuses: [] });
+      if (url.includes("/issues/1")) return Response.json({ number: 1, title: "Issue", state: "open", labels: [], user: { login: "reporter" } });
+      if (url.includes("/branches/")) return Response.json({ protected: false, protection: { required_status_checks: { contexts: [] } } });
+      return Response.json({});
+    });
+    vi.setSystemTime(new Date("2026-05-28T02:00:00.000Z"));
+
+    await expect(
+      processJob(env, { type: "agent-regate-pr", deliveryId: "reviews-syncstate-readfail", repoFullName: "owner/agent-repo", prNumber: 7, installationId: 9001 }),
+    ).resolves.toBeUndefined();
+
+    expect(syncStateSpy).toHaveBeenCalled();
+    syncStateSpy.mockRestore();
   });
 
   it("#audit-rate-headroom: auto-maintain falls back to the public token when a post-gate mint fails", async () => {
@@ -2270,6 +2401,144 @@ describe("queue processors", () => {
     expect(stickyComment.current?.body).toContain(PR_PANEL_COMMENT_MARKER);
     expect(stickyComment.current?.body).toContain("Thanks for the contribution");
     expect(stickyComment.current?.body).not.toContain("is reviewing");
+  });
+
+  it("flags an open-PR file-path collision against a sibling PR when GITTENSORY_OPEN_PR_FILE_COLLISION is on (#2653)", async () => {
+    const env = createTestEnv({
+      GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem(),
+      GITTENSORY_OPEN_PR_FILE_COLLISION: "true",
+    });
+    await upsertRepositoryFromGitHub(env, { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } }, 123);
+    await upsertRepositorySettings(env, {
+      repoFullName: "JSONbored/gittensory",
+      commentMode: "all_prs",
+      publicSurface: "comment_only",
+      autoLabelEnabled: false,
+      checkRunMode: "off",
+      gateCheckMode: "off",
+      aiReviewMode: "off",
+    });
+    // A sibling PR (different author, unrelated title) already open and already detail-synced — its files are
+    // in the pull_request_files cache, the same way routine backfill would have populated them.
+    await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", {
+      number: 8,
+      title: "Document logging output",
+      state: "open",
+      user: { login: "other-author" },
+      head: { sha: "b8" },
+      labels: [],
+      body: "",
+    });
+    await upsertPullRequestFile(env, { repoFullName: "JSONbored/gittensory", pullNumber: 8, path: "src/shared/util.ts", additions: 1, deletions: 0, changes: 1, payload: {} });
+    // The PR under review (#7) was ALSO already detail-synced against the same file before this rerun.
+    await upsertPullRequestFile(env, { repoFullName: "JSONbored/gittensory", pullNumber: 7, path: "src/shared/util.ts", additions: 1, deletions: 0, changes: 1, payload: {} });
+    const stickyComment: { current: { id: number; body: string } | null } = { current: null };
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      const method = init?.method ?? "GET";
+      if (url === "https://api.gittensor.io/miners") {
+        return Response.json([{ uid: 7, githubUsername: "contributor", githubId: "123", totalPrs: 4, totalMergedPrs: 3, totalOpenPrs: 1, totalClosedPrs: 0, totalOpenIssues: 0, totalClosedIssues: 0, totalSolvedIssues: 0, totalValidSolvedIssues: 0, isEligible: true, credibility: 1, eligibleRepoCount: 1 }]);
+      }
+      if (url === "https://api.gittensor.io/miners/123") return Response.json({ repositories: [] });
+      if (url === "https://api.gittensor.io/miners/123/prs") return Response.json([]);
+      if (url === "https://mirror.gittensor.io/api/v1/miners/123/issues") return Response.json({ issues: [] });
+      if (url.endsWith("/users/contributor")) return Response.json({ login: "contributor", public_repos: 2, followers: 1 });
+      if (url.includes("/users/contributor/repos")) return Response.json([]);
+      if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+      if (url.includes("/pulls/7/files")) return Response.json([{ filename: "src/shared/util.ts", status: "modified", additions: 1, deletions: 0, changes: 1, patch: "@@\n+export const ok = true;" }]);
+      if (url.endsWith("/pulls/7")) return Response.json({ number: 7, title: "Improve widget rendering", state: "open", user: { login: "contributor" }, head: { sha: "a7" }, labels: [], body: "" });
+      if (url.includes("/commits/a7/check-runs")) return Response.json({ total_count: 0, check_runs: [] });
+      if (url.includes("/commits/a7/status")) return Response.json({ state: "success", statuses: [] });
+      if (url.includes("/issues/7/comments") && method === "GET") return Response.json([]);
+      if (url.includes("/issues/7/comments") && method === "POST") {
+        const body = String((JSON.parse(String(init?.body ?? "{}")) as { body?: string }).body ?? "");
+        stickyComment.current = { id: 1, body };
+        return Response.json({ id: 1 }, { status: 201 });
+      }
+      if (url.includes("/branches/")) return Response.json({ protected: false, protection: { required_status_checks: { contexts: [] } } });
+      return Response.json({});
+    });
+
+    await processJob(env, {
+      type: "github-webhook",
+      deliveryId: "open-pr-file-collision",
+      eventName: "pull_request",
+      payload: {
+        action: "opened",
+        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+        pull_request: { number: 7, title: "Improve widget rendering", state: "open", user: { login: "contributor" }, head: { sha: "a7" }, labels: [], body: "" },
+      },
+    });
+
+    // The sibling PR #8 (different author, same file, unrelated title) surfaces in the related-work panel —
+    // proof the enriched changedFiles flowed through buildCollisionReport's existing termOverlap scoring.
+    expect(stickyComment.current?.body).toContain("#8");
+  });
+
+  it("does NOT flag an open-PR file-path collision when GITTENSORY_OPEN_PR_FILE_COLLISION is unset (byte-identical default)", async () => {
+    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+    await upsertRepositoryFromGitHub(env, { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } }, 123);
+    await upsertRepositorySettings(env, {
+      repoFullName: "JSONbored/gittensory",
+      commentMode: "all_prs",
+      publicSurface: "comment_only",
+      autoLabelEnabled: false,
+      checkRunMode: "off",
+      gateCheckMode: "off",
+      aiReviewMode: "off",
+    });
+    await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", {
+      number: 8,
+      title: "Document logging output",
+      state: "open",
+      user: { login: "other-author" },
+      head: { sha: "b8" },
+      labels: [],
+      body: "",
+    });
+    await upsertPullRequestFile(env, { repoFullName: "JSONbored/gittensory", pullNumber: 8, path: "src/shared/util.ts", additions: 1, deletions: 0, changes: 1, payload: {} });
+    await upsertPullRequestFile(env, { repoFullName: "JSONbored/gittensory", pullNumber: 7, path: "src/shared/util.ts", additions: 1, deletions: 0, changes: 1, payload: {} });
+    const stickyComment: { current: { id: number; body: string } | null } = { current: null };
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      const method = init?.method ?? "GET";
+      if (url === "https://api.gittensor.io/miners") {
+        return Response.json([{ uid: 7, githubUsername: "contributor", githubId: "123", totalPrs: 4, totalMergedPrs: 3, totalOpenPrs: 1, totalClosedPrs: 0, totalOpenIssues: 0, totalClosedIssues: 0, totalSolvedIssues: 0, totalValidSolvedIssues: 0, isEligible: true, credibility: 1, eligibleRepoCount: 1 }]);
+      }
+      if (url === "https://api.gittensor.io/miners/123") return Response.json({ repositories: [] });
+      if (url === "https://api.gittensor.io/miners/123/prs") return Response.json([]);
+      if (url === "https://mirror.gittensor.io/api/v1/miners/123/issues") return Response.json({ issues: [] });
+      if (url.endsWith("/users/contributor")) return Response.json({ login: "contributor", public_repos: 2, followers: 1 });
+      if (url.includes("/users/contributor/repos")) return Response.json([]);
+      if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+      if (url.includes("/pulls/7/files")) return Response.json([{ filename: "src/shared/util.ts", status: "modified", additions: 1, deletions: 0, changes: 1, patch: "@@\n+export const ok = true;" }]);
+      if (url.endsWith("/pulls/7")) return Response.json({ number: 7, title: "Improve widget rendering", state: "open", user: { login: "contributor" }, head: { sha: "a7" }, labels: [], body: "" });
+      if (url.includes("/commits/a7/check-runs")) return Response.json({ total_count: 0, check_runs: [] });
+      if (url.includes("/commits/a7/status")) return Response.json({ state: "success", statuses: [] });
+      if (url.includes("/issues/7/comments") && method === "GET") return Response.json([]);
+      if (url.includes("/issues/7/comments") && method === "POST") {
+        const body = String((JSON.parse(String(init?.body ?? "{}")) as { body?: string }).body ?? "");
+        stickyComment.current = { id: 1, body };
+        return Response.json({ id: 1 }, { status: 201 });
+      }
+      if (url.includes("/branches/")) return Response.json({ protected: false, protection: { required_status_checks: { contexts: [] } } });
+      return Response.json({});
+    });
+
+    await processJob(env, {
+      type: "github-webhook",
+      deliveryId: "open-pr-file-collision-flag-off",
+      eventName: "pull_request",
+      payload: {
+        action: "opened",
+        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+        pull_request: { number: 7, title: "Improve widget rendering", state: "open", user: { login: "contributor" }, head: { sha: "a7" }, labels: [], body: "" },
+      },
+    });
+
+    expect(stickyComment.current?.body).not.toContain("#8");
   });
 
   it("computes the AI review cache fingerprint with a self-host reviewer plan and converged grounding/enrichment on (#2119)", async () => {
@@ -5669,6 +5938,653 @@ describe("queue processors", () => {
     expect(seen.comments.some((c) => c.includes("blocked from contributing"))).toBe(true);
   });
 
+  describe("live migrations/** collision recheck (#2550)", () => {
+    // Full merge-eligible stub set (clean + green + approved), reused across scenarios — a positive test proves
+    // the collision hold actually suppresses what would otherwise merge; a negative test proves the check
+    // correctly stays out of the way. `liveTree` is the live git/trees response for `main` (the collision
+    // source of truth); `seen.treeCalls` counts how many times it was fetched, so the "no latency for a
+    // non-migrations PR" and "off by default" requirements are directly assertable, not just inferred.
+    function stubMigrationRecheckFetch(prNumber: number, changedFile: { filename: string; status: string } | Array<{ filename: string; status: string }>, liveTree: Array<{ type: string; path: string }> | "error", seen: { closed: boolean; merged: boolean; labels: string[]; comments: string[]; treeCalls: number }) {
+      const changedFiles = Array.isArray(changedFile) ? changedFile : [changedFile];
+      vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url === "https://api.gittensor.io/miners") return Response.json([]);
+        if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+        if (url.includes("/check-runs/") && method === "PATCH") return Response.json({ id: 901 });
+        if (url.includes(`/git/trees/main`)) {
+          seen.treeCalls += 1;
+          if (liveTree === "error") return new Response("not found", { status: 404 });
+          return Response.json({ tree: liveTree });
+        }
+        if (/\/pulls\/\d+(?:\?|$)/.test(url) && method === "GET" && !url.includes(`/pulls/${prNumber}/`)) {
+          return Response.json({ number: prNumber, state: "open", user: { login: "contributor" }, head: { sha: "sha1" }, base: { ref: "main", sha: "base" }, mergeable_state: "clean", labels: [] });
+        }
+        if (url.includes(`/pulls/${prNumber}/files`)) return Response.json(changedFiles.map((f) => ({ ...f, additions: 5, deletions: 0, changes: 5, patch: "@@\n+ALTER TABLE t ADD COLUMN c TEXT;" })));
+        if (url.includes(`/commits/sha1/check-runs`)) return Response.json({ total_count: 0, check_runs: [] });
+        if (url.includes(`/commits/sha1/status`)) return Response.json({ state: "success", statuses: [{ context: "ci/build", state: "success", description: "ok" }] });
+        if (url.includes(`/commits/sha1/check-suites`)) return Response.json({ check_suites: [] });
+        if (url.includes("/branches/")) return Response.json({ contexts: [] });
+        if (url === "https://api.github.com/graphql") return Response.json({ data: { repository: { pullRequest: { reviewDecision: "APPROVED" } } } });
+        if (url.includes(`/pulls/${prNumber}/merge`) && method === "PUT") {
+          seen.merged = true;
+          return Response.json({ merged: true, sha: "merged-sha1" });
+        }
+        if (url.includes(`/pulls/${prNumber}`) && method === "PATCH") {
+          seen.closed = JSON.parse(String(init?.body ?? "{}")).state === "closed";
+          return Response.json({ number: prNumber, state: "closed" });
+        }
+        if (url.includes(`/issues/${prNumber}/labels`) && method === "GET") return Response.json([]);
+        if (url.includes(`/issues/${prNumber}/labels`) && method === "POST") {
+          seen.labels.push(...((JSON.parse(String(init?.body ?? "{}")).labels ?? []) as string[]));
+          return Response.json([]);
+        }
+        if (url.endsWith("/labels") && method === "POST") return Response.json({ name: "x" }, { status: 201 }); // repo-level label creation (createMissingLabel probe)
+        if (url.includes(`/issues/${prNumber}/comments`) && method === "POST") {
+          seen.comments.push(String(JSON.parse(String(init?.body ?? "{}")).body ?? ""));
+          return Response.json({ id: 1 }, { status: 201 });
+        }
+        if (url.includes(`/issues/${prNumber}/comments`)) return Response.json([]);
+        if (url.includes("/check-runs") && method === "POST") return Response.json({ id: 901 }, { status: 201 });
+        return Response.json({});
+      });
+    }
+
+    async function seedMigrationRecheckRepo(env: Env, prNumber: number, opts: { premergeContentRecheck?: boolean } = {}) {
+      await upsertInstallation(env, {
+        installation: { id: 123, account: { login: "owner", id: 1, type: "Organization" }, target_type: "Organization", repository_selection: "selected", permissions: { pull_requests: "write", issues: "write" }, events: [] },
+      });
+      await upsertRepositoryFromGitHub(env, { name: "repo", full_name: "owner/repo", private: false, owner: { login: "owner" } }, 123);
+      await upsertRepositorySettings(env, { repoFullName: "owner/repo", autonomy: { merge: "auto", label: "auto" }, aiReviewMode: "off", gatePack: "oss-anti-slop", gateCheckMode: "enabled", checkRunMode: "off", commentMode: "off", publicSurface: "off" });
+      if (opts.premergeContentRecheck !== undefined) {
+        await upsertRepoFocusManifest(env, "owner/repo", { gate: { premergeContentRecheck: opts.premergeContentRecheck } });
+      }
+      await upsertPullRequestFromGitHub(env, "owner/repo", { number: prNumber, title: "Migration PR", state: "open", user: { login: "contributor" }, head: { sha: "sha1" }, base: { ref: "main" }, labels: [], body: "" });
+    }
+
+    it("holds a would-otherwise-merge PR when the live base has a colliding migration number, with the distinct label + rebase comment", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedMigrationRecheckRepo(env, 60, { premergeContentRecheck: true });
+      const seen = { closed: false, merged: false, labels: [] as string[], comments: [] as string[], treeCalls: 0 };
+      stubMigrationRecheckFetch(60, { filename: "migrations/0099_a.sql", status: "added" }, [{ type: "blob", path: "migrations/0099_b.sql" }], seen);
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "migration-collision-hold", repoFullName: "owner/repo", prNumber: 60, installationId: 123 });
+
+      expect(seen.merged).toBe(false);
+      expect(seen.closed).toBe(false); // held, never closed — this is a hold, not a close
+      expect(seen.labels).toContain("gittensory:migration-collision");
+      expect(seen.comments.some((c) => c.includes("rebase") && c.includes("0099"))).toBe(true);
+      expect(seen.treeCalls).toBe(1);
+    });
+
+    it("does not hold when the base has no colliding number — merges normally", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedMigrationRecheckRepo(env, 61, { premergeContentRecheck: true });
+      const seen = { closed: false, merged: false, labels: [] as string[], comments: [] as string[], treeCalls: 0 };
+      stubMigrationRecheckFetch(61, { filename: "migrations/0099_a.sql", status: "added" }, [{ type: "blob", path: "migrations/0050_unrelated.sql" }], seen);
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "migration-no-collision", repoFullName: "owner/repo", prNumber: 61, installationId: 123 });
+
+      expect(seen.merged).toBe(true);
+      expect(seen.labels).not.toContain("gittensory:migration-collision");
+      expect(seen.treeCalls).toBe(1);
+    });
+
+    it("pays zero latency (never fetches the live tree) for a PR that does not touch migrations/**, even with the recheck enabled", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedMigrationRecheckRepo(env, 62, { premergeContentRecheck: true });
+      const seen = { closed: false, merged: false, labels: [] as string[], comments: [] as string[], treeCalls: 0 };
+      stubMigrationRecheckFetch(62, { filename: "src/index.ts", status: "modified" }, [{ type: "blob", path: "migrations/0099_b.sql" }], seen);
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "migration-not-touched", repoFullName: "owner/repo", prNumber: 62, installationId: 123 });
+
+      expect(seen.treeCalls).toBe(0); // path-gated — never even attempted the live fetch
+      expect(seen.merged).toBe(true);
+    });
+
+    it("is off by default — never fetches the live tree even for a migrations/**-touching PR when unconfigured", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedMigrationRecheckRepo(env, 63); // premergeContentRecheck left unset — defaults off
+      const seen = { closed: false, merged: false, labels: [] as string[], comments: [] as string[], treeCalls: 0 };
+      stubMigrationRecheckFetch(63, { filename: "migrations/0099_a.sql", status: "added" }, [{ type: "blob", path: "migrations/0099_b.sql" }], seen);
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "migration-recheck-off", repoFullName: "owner/repo", prNumber: 63, installationId: 123 });
+
+      expect(seen.treeCalls).toBe(0);
+      expect(seen.merged).toBe(true); // a live collision exists but the feature is off — merges anyway (opt-in)
+    });
+
+    it("fails OPEN (merges normally) when the live tree fetch errors — never holds a PR on inconclusive data", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedMigrationRecheckRepo(env, 64, { premergeContentRecheck: true });
+      const seen = { closed: false, merged: false, labels: [] as string[], comments: [] as string[], treeCalls: 0 };
+      stubMigrationRecheckFetch(64, { filename: "migrations/0099_a.sql", status: "added" }, "error", seen);
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "migration-fetch-error", repoFullName: "owner/repo", prNumber: 64, installationId: 123 });
+
+      expect(seen.treeCalls).toBe(1);
+      expect(seen.merged).toBe(true);
+      expect(seen.labels).not.toContain("gittensory:migration-collision");
+    });
+
+    it("fails OPEN (never fetches the live tree) when the PR has no resolvable base ref", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await upsertInstallation(env, {
+        installation: { id: 123, account: { login: "owner", id: 1, type: "Organization" }, target_type: "Organization", repository_selection: "selected", permissions: { pull_requests: "write", issues: "write" }, events: [] },
+      });
+      // No default_branch on the repo record AND no base.ref on the PR record — baseRef resolves to undefined.
+      await upsertRepositoryFromGitHub(env, { name: "repo", full_name: "owner/repo", private: false, owner: { login: "owner" } }, 123);
+      await upsertRepositorySettings(env, { repoFullName: "owner/repo", autonomy: { merge: "auto", label: "auto" }, aiReviewMode: "off", gatePack: "oss-anti-slop", gateCheckMode: "enabled", checkRunMode: "off", commentMode: "off", publicSurface: "off" });
+      await upsertRepoFocusManifest(env, "owner/repo", { gate: { premergeContentRecheck: true } });
+      await upsertPullRequestFromGitHub(env, "owner/repo", { number: 65, title: "No base ref", state: "open", user: { login: "contributor" }, head: { sha: "sha1" }, labels: [], body: "" });
+      const seen = { closed: false, merged: false, labels: [] as string[], comments: [] as string[], treeCalls: 0 };
+      stubMigrationRecheckFetch(65, { filename: "migrations/0099_a.sql", status: "added" }, [{ type: "blob", path: "migrations/0099_b.sql" }], seen);
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "migration-no-base-ref", repoFullName: "owner/repo", prNumber: 65, installationId: 123 });
+
+      expect(seen.treeCalls).toBe(0); // no live target to compare against — never even attempted the fetch
+      expect(seen.merged).toBe(true);
+      expect(seen.labels).not.toContain("gittensory:migration-collision");
+    });
+
+    it("REGRESSION: is deliberately UNCACHED — a live tree that changes between two consecutive maintenance passes is picked up fresh, never served stale", async () => {
+      // The exact race a caching layer would reintroduce: a sibling PR (not modeled directly here — simulated
+      // by the live tree response CHANGING between the two fetches, the same effect a sibling merge has) adds
+      // a colliding migration file in the window between two maintenance passes on the SAME PR. A cache keyed
+      // by repo+baseRef would serve the first (pre-collision) snapshot on the second pass and miss the
+      // collision entirely — this asserts both passes fetch fresh and the second one correctly detects it.
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedMigrationRecheckRepo(env, 66, { premergeContentRecheck: true });
+      const seen = { closed: false, merged: false, labels: [] as string[], comments: [] as string[], treeCalls: 0 };
+      let liveTree: Array<{ type: string; path: string }> = []; // pass 1: main has nothing colliding yet
+      vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url === "https://api.gittensor.io/miners") return Response.json([]);
+        if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+        if (url.includes("/check-runs/") && method === "PATCH") return Response.json({ id: 901 });
+        if (url.includes("/git/trees/main")) {
+          seen.treeCalls += 1;
+          return Response.json({ tree: liveTree });
+        }
+        if (/\/pulls\/\d+(?:\?|$)/.test(url) && method === "GET" && !url.includes("/pulls/66/")) {
+          return Response.json({ number: 66, state: "open", user: { login: "contributor" }, head: { sha: "sha1" }, base: { ref: "main", sha: "base" }, mergeable_state: "clean", labels: [] });
+        }
+        if (url.includes("/pulls/66/files")) return Response.json([{ filename: "migrations/0099_a.sql", status: "added", additions: 5, deletions: 0, changes: 5, patch: "@@\n+ALTER TABLE t ADD COLUMN c TEXT;" }]);
+        if (url.includes("/commits/sha1/check-runs")) return Response.json({ total_count: 0, check_runs: [] });
+        if (url.includes("/commits/sha1/status")) return Response.json({ state: "success", statuses: [{ context: "ci/build", state: "success", description: "ok" }] });
+        if (url.includes("/commits/sha1/check-suites")) return Response.json({ check_suites: [] });
+        if (url.includes("/branches/")) return Response.json({ contexts: [] });
+        if (url === "https://api.github.com/graphql") return Response.json({ data: { repository: { pullRequest: { reviewDecision: "APPROVED" } } } });
+        if (url.includes("/pulls/66/merge") && method === "PUT") {
+          seen.merged = true;
+          return Response.json({ merged: true, sha: "merged-sha1" });
+        }
+        if (url.includes("/issues/66/labels") && method === "GET") return Response.json([]);
+        if (url.includes("/issues/66/labels") && method === "POST") {
+          seen.labels.push(...((JSON.parse(String(init?.body ?? "{}")).labels ?? []) as string[]));
+          return Response.json([]);
+        }
+        if (url.endsWith("/labels") && method === "POST") return Response.json({ name: "x" }, { status: 201 });
+        if (url.includes("/issues/66/comments")) return Response.json([]);
+        return Response.json({});
+      });
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "migration-fresh-pass-1", repoFullName: "owner/repo", prNumber: 66, installationId: 123 });
+      expect(seen.merged).toBe(true); // pass 1: no collision yet — merges
+
+      // Between passes, a sibling PR merges its own colliding 0099 file — main's live tree now has it.
+      liveTree = [{ type: "blob", path: "migrations/0099_b.sql" }];
+      seen.merged = false;
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "migration-fresh-pass-2", repoFullName: "owner/repo", prNumber: 66, installationId: 123 });
+
+      expect(seen.treeCalls).toBe(2); // every pass fetches fresh — no cache could ever mask the change
+      expect(seen.labels).toContain("gittensory:migration-collision");
+      expect(seen.merged).toBe(false); // pass 2 correctly catches the now-live collision, never stale-served
+    });
+
+    it("does NOT hold for a pre-existing collision between two OTHER files unrelated to this PR's own migration number", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedMigrationRecheckRepo(env, 67, { premergeContentRecheck: true });
+      const seen = { closed: false, merged: false, labels: [] as string[], comments: [] as string[], treeCalls: 0 };
+      // main already has a real collision at 0050 (two unrelated, already-merged files) — nothing to do with
+      // this PR's own migration at 0099. The prNumbers scoping must exclude it: main is already broken by
+      // someone else's mistake, but that must not hold an unrelated third PR.
+      stubMigrationRecheckFetch(67, { filename: "migrations/0099_a.sql", status: "added" }, [
+        { type: "blob", path: "migrations/0050_x.sql" },
+        { type: "blob", path: "migrations/0050_y.sql" },
+      ], seen);
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "migration-unrelated-collision", repoFullName: "owner/repo", prNumber: 67, installationId: 123 });
+
+      expect(seen.merged).toBe(true);
+      expect(seen.labels).not.toContain("gittensory:migration-collision");
+    });
+
+    it("holds and reports every colliding number when a PR touches two migration files that each independently collide", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedMigrationRecheckRepo(env, 68, { premergeContentRecheck: true });
+      const seen = { closed: false, merged: false, labels: [] as string[], comments: [] as string[], treeCalls: 0 };
+      stubMigrationRecheckFetch(
+        68,
+        [
+          { filename: "migrations/0098_a.sql", status: "added" },
+          { filename: "migrations/0099_a.sql", status: "added" },
+        ],
+        [
+          { type: "blob", path: "migrations/0098_b.sql" },
+          { type: "blob", path: "migrations/0099_b.sql" },
+        ],
+        seen,
+      );
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "migration-multi-collision", repoFullName: "owner/repo", prNumber: 68, installationId: 123 });
+
+      expect(seen.merged).toBe(false);
+      expect(seen.labels).toContain("gittensory:migration-collision");
+      expect(seen.comments.some((c) => c.includes("0098") && c.includes("0099"))).toBe(true);
+    });
+
+    it("does not hold when the live base already contains one of the real grandfathered duplicate pairs, unrelated to this PR's own migration number", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedMigrationRecheckRepo(env, 69, { premergeContentRecheck: true });
+      const seen = { closed: false, merged: false, labels: [] as string[], comments: [] as string[], treeCalls: 0 };
+      // The real, already-shipped 0090 grandfathered pair (see KNOWN_MIGRATION_DUPLICATES) is present on main —
+      // this must never trigger a hold for an unrelated PR touching a different number.
+      stubMigrationRecheckFetch(69, { filename: "migrations/0099_a.sql", status: "added" }, [
+        { type: "blob", path: "migrations/0090_contributor_cap_label.sql" },
+        { type: "blob", path: "migrations/0090_pull_request_detail_sync_head_sha.sql" },
+      ], seen);
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "migration-grandfathered", repoFullName: "owner/repo", prNumber: 69, installationId: 123 });
+
+      expect(seen.merged).toBe(true);
+      expect(seen.labels).not.toContain("gittensory:migration-collision");
+    });
+
+    it("REGRESSION: renaming this PR's own not-yet-merged migration file (e.g. a typo fix, same number) does NOT self-collide", async () => {
+      // Before the fix, prMigrationFilenames was derived from changedPathsForGuardrail's collapsed set, which
+      // includes BOTH a renamed file's old and new name — counting one logical file as two and self-colliding.
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedMigrationRecheckRepo(env, 70, { premergeContentRecheck: true });
+      const seen = { closed: false, merged: false, labels: [] as string[], comments: [] as string[], treeCalls: 0 };
+      vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url === "https://api.gittensor.io/miners") return Response.json([]);
+        if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+        if (url.includes("/check-runs/") && method === "PATCH") return Response.json({ id: 901 });
+        if (url.includes("/git/trees/main")) {
+          seen.treeCalls += 1;
+          return Response.json({ tree: [] }); // empty live base — nothing else to collide with
+        }
+        if (/\/pulls\/\d+(?:\?|$)/.test(url) && method === "GET" && !url.includes("/pulls/70/")) {
+          return Response.json({ number: 70, state: "open", user: { login: "contributor" }, head: { sha: "sha1" }, base: { ref: "main", sha: "base" }, mergeable_state: "clean", labels: [] });
+        }
+        // A single GitHub PR-files entry for a rename: status="renamed", filename=new name, previous_filename=old name.
+        if (url.includes("/pulls/70/files")) return Response.json([{ filename: "migrations/0099_add_column.sql", previous_filename: "migrations/0099_add_colum.sql", status: "renamed", additions: 1, deletions: 1, changes: 2, patch: "@@\n rename" }]);
+        if (url.includes("/commits/sha1/check-runs")) return Response.json({ total_count: 0, check_runs: [] });
+        if (url.includes("/commits/sha1/status")) return Response.json({ state: "success", statuses: [{ context: "ci/build", state: "success", description: "ok" }] });
+        if (url.includes("/commits/sha1/check-suites")) return Response.json({ check_suites: [] });
+        if (url.includes("/branches/")) return Response.json({ contexts: [] });
+        if (url === "https://api.github.com/graphql") return Response.json({ data: { repository: { pullRequest: { reviewDecision: "APPROVED" } } } });
+        if (url.includes("/pulls/70/merge") && method === "PUT") {
+          seen.merged = true;
+          return Response.json({ merged: true, sha: "merged-sha1" });
+        }
+        if (url.includes("/issues/70/labels") && method === "GET") return Response.json([]);
+        if (url.includes("/issues/70/labels") && method === "POST") {
+          seen.labels.push(...((JSON.parse(String(init?.body ?? "{}")).labels ?? []) as string[]));
+          return Response.json([]);
+        }
+        if (url.endsWith("/labels") && method === "POST") return Response.json({ name: "x" }, { status: 201 });
+        if (url.includes("/issues/70/comments")) return Response.json([]);
+        return Response.json({});
+      });
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "migration-rename-self", repoFullName: "owner/repo", prNumber: 70, installationId: 123 });
+
+      expect(seen.merged).toBe(true); // no false self-collision from counting the old+new rename names as two files
+      expect(seen.labels).not.toContain("gittensory:migration-collision");
+    });
+
+    it("REGRESSION: renaming an EXISTING base migration (same number) does NOT self-collide with its own old name still live on main", async () => {
+      // Before the fix, liveFilenames (fetched from main, which still has the pre-rename name until this PR
+      // merges) was unioned as-is with prMigrationFilenames (the new name only) — so a same-number typo-fix
+      // rename of an ALREADY-MERGED base migration counted as two distinct files at one number and
+      // self-collided, even though the merged tree would only ever contain the renamed file.
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedMigrationRecheckRepo(env, 73, { premergeContentRecheck: true });
+      const seen = { closed: false, merged: false, labels: [] as string[], comments: [] as string[], treeCalls: 0 };
+      vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url === "https://api.gittensor.io/miners") return Response.json([]);
+        if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+        if (url.includes("/check-runs/") && method === "PATCH") return Response.json({ id: 901 });
+        if (url.includes("/git/trees/main")) {
+          seen.treeCalls += 1;
+          // main still has the PRE-rename name — this PR's rename hasn't merged yet.
+          return Response.json({ tree: [{ type: "blob", path: "migrations/0099_old.sql" }] });
+        }
+        if (/\/pulls\/\d+(?:\?|$)/.test(url) && method === "GET" && !url.includes("/pulls/73/")) {
+          return Response.json({ number: 73, state: "open", user: { login: "contributor" }, head: { sha: "sha1" }, base: { ref: "main", sha: "base" }, mergeable_state: "clean", labels: [] });
+        }
+        // Renames an EXISTING base migration (same number 0099), not a file this PR itself added.
+        if (url.includes("/pulls/73/files")) return Response.json([{ filename: "migrations/0099_new.sql", previous_filename: "migrations/0099_old.sql", status: "renamed", additions: 1, deletions: 1, changes: 2, patch: "@@\n rename" }]);
+        if (url.includes("/commits/sha1/check-runs")) return Response.json({ total_count: 0, check_runs: [] });
+        if (url.includes("/commits/sha1/status")) return Response.json({ state: "success", statuses: [{ context: "ci/build", state: "success", description: "ok" }] });
+        if (url.includes("/commits/sha1/check-suites")) return Response.json({ check_suites: [] });
+        if (url.includes("/branches/")) return Response.json({ contexts: [] });
+        if (url === "https://api.github.com/graphql") return Response.json({ data: { repository: { pullRequest: { reviewDecision: "APPROVED" } } } });
+        if (url.includes("/pulls/73/merge") && method === "PUT") {
+          seen.merged = true;
+          return Response.json({ merged: true, sha: "merged-sha1" });
+        }
+        if (url.includes("/issues/73/labels") && method === "GET") return Response.json([]);
+        if (url.includes("/issues/73/labels") && method === "POST") {
+          seen.labels.push(...((JSON.parse(String(init?.body ?? "{}")).labels ?? []) as string[]));
+          return Response.json([]);
+        }
+        if (url.endsWith("/labels") && method === "POST") return Response.json({ name: "x" }, { status: 201 });
+        if (url.includes("/issues/73/comments")) return Response.json([]);
+        return Response.json({});
+      });
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "migration-rename-existing-base", repoFullName: "owner/repo", prNumber: 73, installationId: 123 });
+
+      expect(seen.merged).toBe(true); // the pre-rename name still live on main must not count against this PR
+      expect(seen.labels).not.toContain("gittensory:migration-collision");
+    });
+
+    it("REGRESSION: renumbering (renaming) this PR's migration to resolve a real collision does not leave a stale hold from the old filename", async () => {
+      // Before the fix, the stale previousFilename (the OLD number) stayed in prMigrationFilenames forever,
+      // colliding with an unrelated already-merged file at that old number and permanently re-holding a PR
+      // that had already fixed itself — exactly the remediation this feature's own comment recommends.
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedMigrationRecheckRepo(env, 71, { premergeContentRecheck: true });
+      const seen = { closed: false, merged: false, labels: [] as string[], comments: [] as string[], treeCalls: 0 };
+      vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url === "https://api.gittensor.io/miners") return Response.json([]);
+        if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+        if (url.includes("/check-runs/") && method === "PATCH") return Response.json({ id: 901 });
+        if (url.includes("/git/trees/main")) {
+          seen.treeCalls += 1;
+          // main already has an unrelated, already-merged file at the OLD number (0099) — nothing to do with
+          // this PR anymore, since it renumbered away from 0099 to 0100.
+          return Response.json({ tree: [{ type: "blob", path: "migrations/0099_other_already_merged.sql" }] });
+        }
+        if (/\/pulls\/\d+(?:\?|$)/.test(url) && method === "GET" && !url.includes("/pulls/71/")) {
+          return Response.json({ number: 71, state: "open", user: { login: "contributor" }, head: { sha: "sha1" }, base: { ref: "main", sha: "base" }, mergeable_state: "clean", labels: [] });
+        }
+        if (url.includes("/pulls/71/files")) return Response.json([{ filename: "migrations/0100_mine.sql", previous_filename: "migrations/0099_mine.sql", status: "renamed", additions: 1, deletions: 1, changes: 2, patch: "@@\n rename" }]);
+        if (url.includes("/commits/sha1/check-runs")) return Response.json({ total_count: 0, check_runs: [] });
+        if (url.includes("/commits/sha1/status")) return Response.json({ state: "success", statuses: [{ context: "ci/build", state: "success", description: "ok" }] });
+        if (url.includes("/commits/sha1/check-suites")) return Response.json({ check_suites: [] });
+        if (url.includes("/branches/")) return Response.json({ contexts: [] });
+        if (url === "https://api.github.com/graphql") return Response.json({ data: { repository: { pullRequest: { reviewDecision: "APPROVED" } } } });
+        if (url.includes("/pulls/71/merge") && method === "PUT") {
+          seen.merged = true;
+          return Response.json({ merged: true, sha: "merged-sha1" });
+        }
+        if (url.includes("/issues/71/labels") && method === "GET") return Response.json([]);
+        if (url.includes("/issues/71/labels") && method === "POST") {
+          seen.labels.push(...((JSON.parse(String(init?.body ?? "{}")).labels ?? []) as string[]));
+          return Response.json([]);
+        }
+        if (url.endsWith("/labels") && method === "POST") return Response.json({ name: "x" }, { status: 201 });
+        if (url.includes("/issues/71/comments")) return Response.json([]);
+        return Response.json({});
+      });
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "migration-renumber-remediation", repoFullName: "owner/repo", prNumber: 71, installationId: 123 });
+
+      expect(seen.merged).toBe(true); // the stale old-number previousFilename must not re-trigger a hold
+      expect(seen.labels).not.toContain("gittensory:migration-collision");
+    });
+
+    it("REGRESSION: deleting this PR's own colliding migration file does not still count it as one of the PR's own filenames", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedMigrationRecheckRepo(env, 72, { premergeContentRecheck: true });
+      const seen = { closed: false, merged: false, labels: [] as string[], comments: [] as string[], treeCalls: 0 };
+      vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url === "https://api.gittensor.io/miners") return Response.json([]);
+        if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+        if (url.includes("/check-runs/") && method === "PATCH") return Response.json({ id: 901 });
+        if (url.includes("/git/trees/main")) {
+          seen.treeCalls += 1;
+          return Response.json({ tree: [{ type: "blob", path: "migrations/0099_other_already_merged.sql" }] });
+        }
+        if (/\/pulls\/\d+(?:\?|$)/.test(url) && method === "GET" && !url.includes("/pulls/72/")) {
+          return Response.json({ number: 72, state: "open", user: { login: "contributor" }, head: { sha: "sha1" }, base: { ref: "main", sha: "base" }, mergeable_state: "clean", labels: [] });
+        }
+        // The PR deletes its own migration file (status="removed") — it no longer exists in the PR's tree.
+        if (url.includes("/pulls/72/files")) return Response.json([{ filename: "migrations/0099_mine.sql", status: "removed", additions: 0, deletions: 5, changes: 5, patch: "@@\n-removed" }]);
+        if (url.includes("/commits/sha1/check-runs")) return Response.json({ total_count: 0, check_runs: [] });
+        if (url.includes("/commits/sha1/status")) return Response.json({ state: "success", statuses: [{ context: "ci/build", state: "success", description: "ok" }] });
+        if (url.includes("/commits/sha1/check-suites")) return Response.json({ check_suites: [] });
+        if (url.includes("/branches/")) return Response.json({ contexts: [] });
+        if (url === "https://api.github.com/graphql") return Response.json({ data: { repository: { pullRequest: { reviewDecision: "APPROVED" } } } });
+        if (url.includes("/pulls/72/merge") && method === "PUT") {
+          seen.merged = true;
+          return Response.json({ merged: true, sha: "merged-sha1" });
+        }
+        if (url.includes("/issues/72/labels") && method === "GET") return Response.json([]);
+        if (url.includes("/issues/72/labels") && method === "POST") {
+          seen.labels.push(...((JSON.parse(String(init?.body ?? "{}")).labels ?? []) as string[]));
+          return Response.json([]);
+        }
+        if (url.endsWith("/labels") && method === "POST") return Response.json({ name: "x" }, { status: 201 });
+        if (url.includes("/issues/72/comments")) return Response.json([]);
+        return Response.json({});
+      });
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "migration-removed-file", repoFullName: "owner/repo", prNumber: 72, installationId: 123 });
+
+      // With no migrations/**-touching file left in the PR's own set (the only entry is `status: "removed"`),
+      // prMigrationFilenames is empty — the whole recheck is path-gated off, so it never even fetches the tree.
+      expect(seen.treeCalls).toBe(0);
+      expect(seen.merged).toBe(true);
+      expect(seen.labels).not.toContain("gittensory:migration-collision");
+    });
+  });
+
+  describe("force-fresh-rebase-before-merge gate (#2552)", () => {
+    // Full merge-eligible stub set (clean + green + approved), reused across scenarios — mirrors the #2550
+    // migration-recheck fixture above. `baseAdvancedAt` stubs the NEW /commits/{baseRef} freshness read;
+    // `null` simulates an unreadable base commit (404).
+    function stubFreshRebaseFetch(prNumber: number, opts: { baseAdvancedAt: string | null; mergeableState?: string; headSha?: string }, seen: { merged: boolean; updateBranchCalls: number; baseCommitCalls: number }) {
+      const headSha = opts.headSha ?? "sha1";
+      vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input.toString();
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url === "https://api.gittensor.io/miners") return Response.json([]);
+        if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+        if (url.includes("/check-runs/") && method === "PATCH") return Response.json({ id: 901 });
+        if (url.includes(`/pulls/${prNumber}/update-branch`) && method === "PUT") {
+          seen.updateBranchCalls += 1;
+          return Response.json({ message: "Updating pull request branch." }, { status: 202 });
+        }
+        if (url.endsWith("/commits/main")) {
+          seen.baseCommitCalls += 1;
+          if (opts.baseAdvancedAt === null) return new Response("not found", { status: 404 });
+          return Response.json({ commit: { committer: { date: opts.baseAdvancedAt } } });
+        }
+        if (/\/pulls\/\d+(?:\?|$)/.test(url) && method === "GET" && !url.includes(`/pulls/${prNumber}/`)) {
+          return Response.json({ number: prNumber, state: "open", user: { login: "contributor" }, head: { sha: headSha }, base: { ref: "main", sha: "base" }, mergeable_state: opts.mergeableState ?? "clean", labels: [] });
+        }
+        if (url.includes(`/pulls/${prNumber}/files`)) return Response.json([{ filename: "src/index.ts", status: "modified", additions: 5, deletions: 1, changes: 6, patch: "@@\n+export const x = 1;" }]);
+        if (url.includes(`/commits/${headSha}/check-runs`)) return Response.json({ total_count: 0, check_runs: [] });
+        if (url.includes(`/commits/${headSha}/status`)) return Response.json({ state: "success", statuses: [{ context: "ci/build", state: "success", description: "ok" }] });
+        if (url.includes(`/commits/${headSha}/check-suites`)) return Response.json({ check_suites: [] });
+        if (url.includes("/branches/")) return Response.json({ contexts: [] });
+        if (url === "https://api.github.com/graphql") return Response.json({ data: { repository: { pullRequest: { reviewDecision: "APPROVED" } } } });
+        if (url.includes(`/pulls/${prNumber}/merge`) && method === "PUT") {
+          seen.merged = true;
+          return Response.json({ merged: true, sha: "merged-sha1" });
+        }
+        if (url.includes(`/issues/${prNumber}/labels`) && method === "GET") return Response.json([]);
+        if (url.includes(`/issues/${prNumber}/labels`) && method === "POST") return Response.json([]);
+        if (url.endsWith("/labels") && method === "POST") return Response.json({ name: "x" }, { status: 201 });
+        if (url.includes(`/issues/${prNumber}/comments`)) return Response.json([]);
+        if (url.includes("/check-runs") && method === "POST") return Response.json({ id: 901 }, { status: 201 });
+        return Response.json({});
+      });
+    }
+
+    async function seedFreshRebaseRepo(env: Env, prNumber: number, opts: { requireFreshRebaseWindowMinutes?: number | null; autonomy?: Record<string, string> } = {}) {
+      await upsertInstallation(env, {
+        installation: { id: 123, account: { login: "owner", id: 1, type: "Organization" }, target_type: "Organization", repository_selection: "selected", permissions: { pull_requests: "write", issues: "write" }, events: [] },
+      });
+      await upsertRepositoryFromGitHub(env, { name: "repo", full_name: "owner/repo", private: false, owner: { login: "owner" } }, 123);
+      await upsertRepositorySettings(env, {
+        repoFullName: "owner/repo",
+        autonomy: opts.autonomy ?? { merge: "auto", update_branch: "auto", label: "auto" },
+        autoMaintain: { requireApprovals: 0, mergeMethod: "squash" },
+        aiReviewMode: "off",
+        gatePack: "oss-anti-slop",
+        gateCheckMode: "enabled",
+        checkRunMode: "off",
+        commentMode: "off",
+        publicSurface: "off",
+        ...(opts.requireFreshRebaseWindowMinutes !== undefined ? { requireFreshRebaseWindowMinutes: opts.requireFreshRebaseWindowMinutes } : {}),
+      });
+      await upsertPullRequestFromGitHub(env, "owner/repo", { number: prNumber, title: "Fresh rebase PR", state: "open", user: { login: "contributor" }, head: { sha: "sha1" }, base: { ref: "main" }, labels: [], body: "" });
+    }
+
+    it("merges normally when the base has not advanced recently", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedFreshRebaseRepo(env, 90, { requireFreshRebaseWindowMinutes: 10 });
+      const seen = { merged: false, updateBranchCalls: 0, baseCommitCalls: 0 };
+      stubFreshRebaseFetch(90, { baseAdvancedAt: new Date(Date.now() - 60 * 60_000).toISOString() }, seen); // 1h ago, outside a 10m window
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "fresh-rebase-old-base", repoFullName: "owner/repo", prNumber: 90, installationId: 123 });
+
+      expect(seen.baseCommitCalls).toBe(1);
+      expect(seen.updateBranchCalls).toBe(0);
+      expect(seen.merged).toBe(true);
+      const merge = await env.DB.prepare("select outcome from audit_events where event_type = ?").bind("agent.action.merge").first<{ outcome: string }>();
+      expect(merge?.outcome).toBe("completed");
+    });
+
+    it("forces update_branch instead of merging when the base advanced within the freshness window", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedFreshRebaseRepo(env, 91, { requireFreshRebaseWindowMinutes: 10 });
+      const seen = { merged: false, updateBranchCalls: 0, baseCommitCalls: 0 };
+      stubFreshRebaseFetch(91, { baseAdvancedAt: new Date(Date.now() - 60_000).toISOString() }, seen); // 1 minute ago, within a 10m window
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "fresh-rebase-forced", repoFullName: "owner/repo", prNumber: 91, installationId: 123 });
+
+      expect(seen.updateBranchCalls).toBe(1);
+      expect(seen.merged).toBe(false);
+      const ub = await env.DB.prepare("select outcome from audit_events where event_type = ?").bind("agent.action.update_branch").first<{ outcome: string }>();
+      expect(ub?.outcome).toBe("completed");
+      const forced = await env.DB.prepare("select outcome from audit_events where event_type = ?").bind("agent.action.forced_rebase_freshness").first<{ outcome: string }>();
+      expect(forced?.outcome).toBe("completed");
+      const merge = await env.DB.prepare("select count(*) as n from audit_events where event_type = ?").bind("agent.action.merge").first<{ n: number }>();
+      expect(merge?.n).toBe(0);
+    });
+
+    it("never fetches the base commit or forces a rebase when the setting is unset (off by default)", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedFreshRebaseRepo(env, 92); // requireFreshRebaseWindowMinutes left unset
+      const seen = { merged: false, updateBranchCalls: 0, baseCommitCalls: 0 };
+      stubFreshRebaseFetch(92, { baseAdvancedAt: new Date().toISOString() }, seen); // "now" — would force if the setting were on
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "fresh-rebase-off", repoFullName: "owner/repo", prNumber: 92, installationId: 123 });
+
+      expect(seen.baseCommitCalls).toBe(0);
+      expect(seen.updateBranchCalls).toBe(0);
+      expect(seen.merged).toBe(true);
+    });
+
+    it("falls through to a normal merge once the bounded-retry cap is reached, with a cap-exceeded audit event", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedFreshRebaseRepo(env, 93, { requireFreshRebaseWindowMinutes: 10 });
+      // Seed the bounded-retry counter at the cap (3) for this repo+PR, matching what 3 prior forced
+      // attempts would have left behind.
+      await env.SELFHOST_TRANSIENT_CACHE?.set("fresh-rebase-forced:owner/repo#93", "3", 24 * 3600);
+      const seen = { merged: false, updateBranchCalls: 0, baseCommitCalls: 0 };
+      stubFreshRebaseFetch(93, { baseAdvancedAt: new Date(Date.now() - 60_000).toISOString() }, seen); // still within window
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "fresh-rebase-capped", repoFullName: "owner/repo", prNumber: 93, installationId: 123 });
+
+      expect(seen.updateBranchCalls).toBe(0); // capped — never forces a 4th attempt
+      expect(seen.merged).toBe(true); // falls through to a normal merge instead
+      const capped = await env.DB.prepare("select outcome from audit_events where event_type = ?").bind("agent.action.fresh_rebase_window_cap_exceeded").first<{ outcome: string }>();
+      expect(capped?.outcome).toBe("completed");
+    });
+
+    it("fails open (merges normally) when the base commit is unreadable", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedFreshRebaseRepo(env, 94, { requireFreshRebaseWindowMinutes: 10 });
+      const seen = { merged: false, updateBranchCalls: 0, baseCommitCalls: 0 };
+      stubFreshRebaseFetch(94, { baseAdvancedAt: null }, seen); // 404 on the base commit fetch
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "fresh-rebase-unreadable", repoFullName: "owner/repo", prNumber: 94, installationId: 123 });
+
+      expect(seen.baseCommitCalls).toBe(1);
+      expect(seen.updateBranchCalls).toBe(0);
+      expect(seen.merged).toBe(true);
+    });
+
+    it("falls through to a normal merge when the forced update_branch action itself is not authorized", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      // update_branch is deliberately absent from autonomy (resolves to the deny-by-default "observe" level),
+      // while merge stays "auto" — proving the freshness gate fails open independently of the eventual merge
+      // action's own authorization.
+      await seedFreshRebaseRepo(env, 95, { requireFreshRebaseWindowMinutes: 10, autonomy: { merge: "auto", label: "auto" } });
+      const seen = { merged: false, updateBranchCalls: 0, baseCommitCalls: 0 };
+      stubFreshRebaseFetch(95, { baseAdvancedAt: new Date(Date.now() - 60_000).toISOString() }, seen); // within window
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "fresh-rebase-not-authorized", repoFullName: "owner/repo", prNumber: 95, installationId: 123 });
+
+      expect(seen.baseCommitCalls).toBe(1);
+      expect(seen.updateBranchCalls).toBe(0); // denied by autonomy before any GitHub mutation is attempted
+      expect(seen.merged).toBe(true); // falls through to the normal merge decision
+      const denied = await env.DB.prepare("select outcome from audit_events where event_type = ? order by created_at desc limit 1").bind("agent.action.update_branch").first<{ outcome: string }>();
+      expect(denied?.outcome).toBe("denied");
+    });
+
+    it("REGRESSION (gate finding): the bounded-retry counter accumulates across successful forces even though each one changes the head SHA", async () => {
+      // A successful update_branch itself produces a NEW head SHA (the merge-base-into-head commit). The
+      // counter must NOT reset just because ITS OWN action changed the head -- otherwise the cap could never
+      // be reached via the exact path it exists to bound, and a fast-moving base would force a rebase on
+      // EVERY pass forever. Simulates 3 rounds, each with a genuinely different head SHA (mirroring the
+      // synchronize webhook a real update_branch triggers), then a 4th round proving the cap holds.
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await seedFreshRebaseRepo(env, 96, { requireFreshRebaseWindowMinutes: 10 });
+      const shas = ["sha-r1", "sha-r2", "sha-r3", "sha-r4"];
+
+      for (const [round, sha] of shas.entries()) {
+        await upsertPullRequestFromGitHub(env, "owner/repo", { number: 96, title: "Fresh rebase PR", state: "open", user: { login: "contributor" }, head: { sha }, base: { ref: "main" }, labels: [], body: "" });
+        const seen = { merged: false, updateBranchCalls: 0, baseCommitCalls: 0 };
+        stubFreshRebaseFetch(96, { baseAdvancedAt: new Date(Date.now() - 60_000).toISOString(), headSha: sha }, seen); // always within window
+
+        await processJob(env, { type: "agent-regate-pr", deliveryId: `fresh-rebase-multi-round-${round}`, repoFullName: "owner/repo", prNumber: 96, installationId: 123 });
+
+        if (round < 3) {
+          // Rounds 0-2 (attempts 1-3): still under/at the cap -- forces update_branch, never merges.
+          expect(seen.updateBranchCalls).toBe(1);
+          expect(seen.merged).toBe(false);
+        } else {
+          // Round 3 (the 4th evaluation): the cap (3) was already reached by round 2 -- falls through to merge.
+          expect(seen.updateBranchCalls).toBe(0);
+          expect(seen.merged).toBe(true);
+        }
+      }
+
+      const forcedCount = await env.DB.prepare("select count(*) as n from audit_events where event_type = ?").bind("agent.action.forced_rebase_freshness").first<{ n: number }>();
+      expect(forcedCount?.n).toBe(3); // exactly 3 successful forces, not 4
+      const capped = await env.DB.prepare("select outcome from audit_events where event_type = ?").bind("agent.action.fresh_rebase_window_cap_exceeded").first<{ outcome: string }>();
+      expect(capped?.outcome).toBe("completed");
+    });
+  });
+
   it("contributor open-PR cap (#2270): a contributor's 3rd open PR (over a cap of 2) is labeled + closed deterministically with no merit merge", async () => {
     let aiCalls = 0;
     const env = createTestEnv({
@@ -5960,6 +6876,269 @@ describe("queue processors", () => {
 
     // Ghost PR's null authorLogin never matches "farmer99" — the count is still exactly 3 (farmer99's own).
     expect(seen.closed).toBe(true);
+  });
+
+  function stubAccountAgeFetch(prNumber: number, createdAt: string, seen: { labels: string[]; closed: boolean }) {
+    return async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      const method = init?.method ?? "GET";
+      if (url === "https://api.gittensor.io/miners") return Response.json([]);
+      if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+      if (url.includes("/users/")) return Response.json({ login: "newbie", created_at: createdAt });
+      if (url.includes(`/pulls/${prNumber}/files`)) return Response.json([{ filename: "src/a.ts", status: "modified", additions: 1, deletions: 0, changes: 1, patch: "@@\n+const ok = true;" }]);
+      if (url.includes(`/pulls/${prNumber}/reviews`)) return Response.json([]);
+      if (url.includes(`/pulls/${prNumber}/commits`)) return Response.json([]);
+      if (url.endsWith(`/pulls/${prNumber}`) && method === "PATCH") { seen.closed = JSON.parse(String(init?.body ?? "{}")).state === "closed"; return Response.json({ number: prNumber, state: "closed" }); }
+      if (url.endsWith(`/pulls/${prNumber}`)) return Response.json({ number: prNumber, state: "open", user: { login: "newbie" }, head: { sha: `s${prNumber}` }, mergeable_state: "clean" });
+      if (url.includes(`/commits/s${prNumber}/check-runs`)) return Response.json({ total_count: 0, check_runs: [] });
+      if (url.includes(`/commits/s${prNumber}/status`)) return Response.json({ state: "success", statuses: [] });
+      if (url.includes(`/issues/${prNumber}/labels`) && method === "GET") return Response.json([]);
+      if (url.includes(`/issues/${prNumber}/labels`) && method === "POST") { seen.labels.push(...((JSON.parse(String(init?.body ?? "{}")).labels ?? []) as string[])); return Response.json([]); }
+      if (url.endsWith("/labels") && method === "POST") return Response.json({ name: "x" }, { status: 201 });
+      if (url.includes(`/issues/${prNumber}/comments`)) return Response.json([]);
+      return Response.json({});
+    };
+  }
+
+  it("account-age throttle (#2561): a below-threshold-age account gets the new-account label AND a tighter effective cap", async () => {
+    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+    await upsertInstallation(env, {
+      installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" }, target_type: "User", repository_selection: "all", permissions: { metadata: "read", pull_requests: "write", issues: "write" }, events: ["pull_request"] },
+      repositories: [{ name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } }],
+    });
+    // Two pre-existing open PRs from the same new author — a cap of 4 (tightened to 2 for a new account)
+    // means the 3rd PR is already over the tightened cap, even though it's well under the CONFIGURED cap of 4.
+    await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", { number: 60, title: "Newbie PR one", state: "open", user: { login: "newbie" }, head: { sha: "s60" }, labels: [], body: "x" });
+    await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", { number: 61, title: "Newbie PR two", state: "open", user: { login: "newbie" }, head: { sha: "s61" }, labels: [], body: "y" });
+    await upsertRepositorySettings(env, {
+      repoFullName: "JSONbored/gittensory",
+      commentMode: "all_prs",
+      gateCheckMode: "enabled",
+      autonomy: { close: "auto", label: "auto" },
+      contributorOpenPrCap: 4,
+      accountAgeThresholdDays: 30,
+    });
+    const seen = { labels: [] as string[], closed: false };
+    // Account created 2 days ago — well under the 30-day threshold.
+    vi.stubGlobal("fetch", stubAccountAgeFetch(62, new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(), seen));
+
+    await processJob(env, {
+      type: "github-webhook",
+      deliveryId: "account-age-tighter-cap",
+      eventName: "pull_request",
+      payload: {
+        action: "opened",
+        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+        pull_request: { number: 62, title: "Newbie's 3rd PR", state: "open", user: { login: "newbie" }, head: { sha: "s62" }, labels: [], body: "x", mergeable_state: "clean" },
+      },
+    });
+
+    expect(seen.labels).toContain("new-account");
+    // The tightened cap (ceil(4/2)=2) is already exceeded by the 3rd PR — closed despite being under the raw cap of 4.
+    expect(seen.closed).toBe(true);
+  });
+
+  it("account-age throttle (#2561): an account OLDER than the threshold is unaffected — no label, no cap tightening", async () => {
+    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+    await upsertInstallation(env, {
+      installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" }, target_type: "User", repository_selection: "all", permissions: { metadata: "read", pull_requests: "write", issues: "write" }, events: ["pull_request"] },
+      repositories: [{ name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } }],
+    });
+    await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", { number: 63, title: "Vet PR one", state: "open", user: { login: "newbie" }, head: { sha: "s63" }, labels: [], body: "x" });
+    await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", { number: 64, title: "Vet PR two", state: "open", user: { login: "newbie" }, head: { sha: "s64" }, labels: [], body: "y" });
+    await upsertRepositorySettings(env, {
+      repoFullName: "JSONbored/gittensory",
+      commentMode: "all_prs",
+      gateCheckMode: "enabled",
+      autonomy: { close: "auto", label: "auto" },
+      contributorOpenPrCap: 4,
+      accountAgeThresholdDays: 30,
+    });
+    const seen = { labels: [] as string[], closed: false };
+    // Account created 2 years ago — well over the 30-day threshold.
+    vi.stubGlobal("fetch", stubAccountAgeFetch(65, new Date(Date.now() - 730 * 24 * 60 * 60 * 1000).toISOString(), seen));
+
+    await processJob(env, {
+      type: "github-webhook",
+      deliveryId: "account-age-unaffected",
+      eventName: "pull_request",
+      payload: {
+        action: "opened",
+        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+        pull_request: { number: 65, title: "Vet's 3rd PR", state: "open", user: { login: "newbie" }, head: { sha: "s65" }, labels: [], body: "x", mergeable_state: "clean" },
+      },
+    });
+
+    expect(seen.labels).not.toContain("new-account");
+    // The RAW cap (4) is not yet exceeded by a 3rd PR — untouched.
+    expect(seen.closed).toBe(false);
+  });
+
+  it("account-age throttle (#2561): the repo OWNER's own PR is never labeled even on a brand-new account", async () => {
+    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+    await upsertInstallation(env, {
+      installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" }, target_type: "User", repository_selection: "all", permissions: { metadata: "read", pull_requests: "write", issues: "write" }, events: ["pull_request"] },
+      repositories: [{ name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } }],
+    });
+    await upsertRepositorySettings(env, {
+      repoFullName: "JSONbored/gittensory",
+      commentMode: "all_prs",
+      gateCheckMode: "enabled",
+      accountAgeThresholdDays: 30,
+    });
+    const seen = { labels: [] as string[], closed: false };
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      const method = init?.method ?? "GET";
+      if (url === "https://api.gittensor.io/miners") return Response.json([]);
+      if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+      if (url.includes("/users/")) return Response.json({ login: "JSONbored", created_at: new Date().toISOString() });
+      if (url.includes("/pulls/66/files")) return Response.json([{ filename: "src/a.ts", status: "modified", additions: 1, deletions: 0, changes: 1, patch: "@@\n+const ok = true;" }]);
+      if (url.includes("/pulls/66/reviews")) return Response.json([]);
+      if (url.includes("/pulls/66/commits")) return Response.json([]);
+      if (url.endsWith("/pulls/66")) return Response.json({ number: 66, state: "open", user: { login: "JSONbored" }, head: { sha: "s66" }, mergeable_state: "clean" });
+      if (url.includes("/commits/s66/check-runs")) return Response.json({ total_count: 0, check_runs: [] });
+      if (url.includes("/commits/s66/status")) return Response.json({ state: "success", statuses: [] });
+      if (url.includes("/issues/66/labels") && method === "GET") return Response.json([]);
+      if (url.includes("/issues/66/labels") && method === "POST") { seen.labels.push(...((JSON.parse(String(init?.body ?? "{}")).labels ?? []) as string[])); return Response.json([]); }
+      if (url.includes("/issues/66/comments")) return Response.json([]);
+      return Response.json({});
+    });
+
+    await processJob(env, {
+      type: "github-webhook",
+      deliveryId: "account-age-owner-exempt",
+      eventName: "pull_request",
+      payload: {
+        action: "opened",
+        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+        pull_request: { number: 66, title: "Owner's own PR", state: "open", user: { login: "JSONbored" }, head: { sha: "s66" }, labels: [], body: "x", mergeable_state: "clean" },
+      },
+    });
+
+    expect(seen.labels).not.toContain("new-account");
+  });
+
+  it("account-age throttle (#2561): disabled (no threshold configured, the default) never fetches the GitHub user or labels", async () => {
+    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+    await upsertInstallation(env, {
+      installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" }, target_type: "User", repository_selection: "all", permissions: { metadata: "read", pull_requests: "write", issues: "write" }, events: ["pull_request"] },
+      repositories: [{ name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } }],
+    });
+    await upsertRepositorySettings(env, {
+      repoFullName: "JSONbored/gittensory",
+      commentMode: "all_prs",
+      gateCheckMode: "enabled",
+      autonomy: { close: "auto", label: "auto" },
+      // accountAgeThresholdDays intentionally omitted — off by default.
+    });
+    const seen = { labels: [] as string[], accountAgeUsersFetched: false };
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input.toString();
+      const method = init?.method ?? "GET";
+      if (url === "https://api.gittensor.io/miners") return Response.json([]);
+      if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+      // Distinct from the UNRELATED, always-on public-contributor-profile lookup (src/github/public.ts), which
+      // hits this same bare /users/{login} URL but with NO authorization header (GITHUB_PUBLIC_TOKEN unset in
+      // this test) — only getGithubUserCreatedAt's account-age-specific call sends a Bearer installation token.
+      if (url.includes("/users/") && (init?.headers as Record<string, string> | undefined)?.authorization) {
+        seen.accountAgeUsersFetched = true;
+        return Response.json({ login: "newbie", created_at: new Date().toISOString() });
+      }
+      if (url.includes("/users/")) return Response.json({ login: "newbie" });
+      if (url.includes("/pulls/67/files")) return Response.json([{ filename: "src/a.ts", status: "modified", additions: 1, deletions: 0, changes: 1, patch: "@@\n+const ok = true;" }]);
+      if (url.includes("/pulls/67/reviews")) return Response.json([]);
+      if (url.includes("/pulls/67/commits")) return Response.json([]);
+      if (url.endsWith("/pulls/67")) return Response.json({ number: 67, state: "open", user: { login: "newbie" }, head: { sha: "s67" }, mergeable_state: "clean" });
+      if (url.includes("/commits/s67/check-runs")) return Response.json({ total_count: 0, check_runs: [] });
+      if (url.includes("/commits/s67/status")) return Response.json({ state: "success", statuses: [] });
+      if (url.includes("/issues/67/labels") && method === "GET") return Response.json([]);
+      if (url.includes("/issues/67/labels") && method === "POST") { seen.labels.push(...((JSON.parse(String(init?.body ?? "{}")).labels ?? []) as string[])); return Response.json([]); }
+      if (url.includes("/issues/67/comments")) return Response.json([]);
+      return Response.json({});
+    });
+
+    await processJob(env, {
+      type: "github-webhook",
+      deliveryId: "account-age-disabled",
+      eventName: "pull_request",
+      payload: {
+        action: "opened",
+        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+        pull_request: { number: 67, title: "Newbie's PR", state: "open", user: { login: "newbie" }, head: { sha: "s67" }, labels: [], body: "x", mergeable_state: "clean" },
+      },
+    });
+
+    expect(seen.accountAgeUsersFetched).toBe(false);
+    expect(seen.labels).not.toContain("new-account");
+  });
+
+  it("account-age throttle (#2561): a configured newAccountLabel is used instead of the default", async () => {
+    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+    await upsertInstallation(env, {
+      installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" }, target_type: "User", repository_selection: "all", permissions: { metadata: "read", pull_requests: "write", issues: "write" }, events: ["pull_request"] },
+      repositories: [{ name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } }],
+    });
+    await upsertRepositorySettings(env, {
+      repoFullName: "JSONbored/gittensory",
+      commentMode: "all_prs",
+      gateCheckMode: "enabled",
+      autonomy: { close: "auto", label: "auto" },
+      accountAgeThresholdDays: 30,
+      newAccountLabel: "custom-new-account-label",
+    });
+    const seen = { labels: [] as string[], closed: false };
+    vi.stubGlobal("fetch", stubAccountAgeFetch(68, new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(), seen));
+
+    await processJob(env, {
+      type: "github-webhook",
+      deliveryId: "account-age-custom-label",
+      eventName: "pull_request",
+      payload: {
+        action: "opened",
+        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+        pull_request: { number: 68, title: "Newbie's PR", state: "open", user: { login: "newbie" }, head: { sha: "s68" }, labels: [], body: "x", mergeable_state: "clean" },
+      },
+    });
+
+    expect(seen.labels).toContain("custom-new-account-label");
+    expect(seen.labels).not.toContain("new-account");
+  });
+
+  it("account-age throttle (#2561): a below-threshold account is NOT labeled when the repo has not opted into label autonomy (regression, gate finding)", async () => {
+    const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+    await upsertInstallation(env, {
+      installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" }, target_type: "User", repository_selection: "all", permissions: { metadata: "read", pull_requests: "write", issues: "write" }, events: ["pull_request"] },
+      repositories: [{ name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } }],
+    });
+    await upsertRepositorySettings(env, {
+      repoFullName: "JSONbored/gittensory",
+      commentMode: "all_prs",
+      gateCheckMode: "enabled",
+      // autonomy intentionally omitted — deny-by-default ("observe" for every action class, including "label").
+      accountAgeThresholdDays: 30,
+    });
+    const seen = { labels: [] as string[], closed: false };
+    vi.stubGlobal("fetch", stubAccountAgeFetch(69, new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(), seen));
+
+    await processJob(env, {
+      type: "github-webhook",
+      deliveryId: "account-age-label-not-autonomous",
+      eventName: "pull_request",
+      payload: {
+        action: "opened",
+        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+        pull_request: { number: 69, title: "Newbie's PR", state: "open", user: { login: "newbie" }, head: { sha: "s69" }, labels: [], body: "x", mergeable_state: "clean" },
+      },
+    });
+
+    expect(seen.labels).not.toContain("new-account");
   });
 
   it("contributor open-PR cap (#2270): out-of-order webhook delivery wakes and self-corrects the missed sibling (regression, gate finding on #2479)", async () => {
@@ -11064,6 +12243,54 @@ describe("queue processors", () => {
       expect(seen.closed).toBe(false);
     });
 
+    it("REGRESSION (gate-flagged): caps an oversized review-nag cooldown at MAX_REVIEW_NAG_COOLDOWN_DAYS before Date arithmetic, even when the resolved settings object itself carries an oversized value", async () => {
+      // upsertRepositorySettings/getRepositorySettings both clamp reviewNagCooldownDays on write AND read, so
+      // seeding an oversized value through the normal repository layer (even via a raw DB update bypassing the
+      // write-time clamp) can never actually reach maybeThrottleReviewNagPing uncapped -- the read-time clamp in
+      // getRepositorySettings neutralizes it first. Mock resolveRepositorySettings directly so this test proves
+      // processors.ts's OWN Math.min(reviewNagCooldownDays, MAX_REVIEW_NAG_COOLDOWN_DAYS) guard, not the DB layer.
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await upsertRepositorySettings(env, { repoFullName: "JSONbored/gittensory", reviewNagPolicy: "hold", reviewNagMaxPings: 3 });
+      await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", { number: 206, title: "Huge cooldown", state: "open", user: { login: "chatty" }, author_association: "NONE", labels: [], body: "" });
+      // Three prior pings, all 400 DAYS ago -- outside the 365-day cap, but well within an uncapped
+      // "1,000,000,000-day" window. If the guard clamps correctly, these fall outside the window and don't
+      // count; if the guard were removed, the uncapped window would count all three, crossing maxPings=3.
+      vi.setSystemTime(new Date("2025-04-24T00:00:00.000Z"));
+      for (let i = 0; i < 3; i += 1) {
+        await repositoriesModule.recordAuditEvent(env, { eventType: "github_app.review_nag_ping", actor: "chatty", targetKey: "JSONbored/gittensory#206", outcome: "completed" });
+      }
+      vi.setSystemTime(new Date("2026-05-29T00:00:00.000Z")); // ~400 days later
+      const baseSettings = await repositorySettingsModule.resolveRepositorySettings(env, "JSONbored/gittensory");
+      const resolveSettingsSpy = vi
+        .spyOn(repositorySettingsModule, "resolveRepositorySettings")
+        .mockResolvedValueOnce({ ...baseSettings, reviewNagCooldownDays: 1_000_000_000 });
+      const seen = { comments: [] as string[], labels: [] as string[], closed: false };
+      stubReviewNagFetch(206, seen);
+
+      await processJob(env, {
+        type: "github-webhook",
+        deliveryId: "nag-huge-cooldown",
+        eventName: "issue_comment",
+        payload: {
+          action: "created",
+          installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+          repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+          issue: { number: 206, title: "Huge cooldown", state: "open", pull_request: {}, user: { login: "chatty" }, author_association: "NONE" },
+          comment: { id: 1, body: "@gittensory help", user: { login: "chatty", type: "User" }, author_association: "NONE" },
+        },
+      });
+
+      // The 400-day-old pings fell outside the CAPPED 365-day window, so this is only the 1st ping this
+      // window — under maxPings=3, never throttled. An uncapped window would have counted all 3 prior pings
+      // (pingCount=4 > maxPings=3) and applied the cooldown instead.
+      const applied = await env.DB.prepare("select count(*) as n from audit_events where event_type = 'github_app.review_nag_cooldown_applied'").first<{ n: number }>();
+      expect(applied?.n).toBe(0);
+      expect(seen.closed).toBe(false);
+      expect(seen.comments.some((c) => c.includes("cooldown limit"))).toBe(false);
+      expect(resolveSettingsSpy).toHaveBeenCalled();
+      resolveSettingsSpy.mockRestore();
+    });
+
     it("records pings under the configured threshold without acting; the normal @gittensory reply still proceeds", async () => {
       const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
       await upsertRepositorySettings(env, { repoFullName: "JSONbored/gittensory", reviewNagPolicy: "close", reviewNagMaxPings: 3 });
@@ -11420,6 +12647,145 @@ describe("queue processors", () => {
     });
   });
 
+  describe("per-command @gittensory rate limit (#2560)", () => {
+    function stubCommandRateLimitFetch(issueNumber: number, seen: { comments: string[] }) {
+      vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = input.toString();
+        const method = init?.method ?? "GET";
+        if (url.includes("/access_tokens")) return Response.json({ token: "fake-installation-token" });
+        if (url.includes("/collaborators/") && url.includes("/permission")) return Response.json({ permission: "maintain" });
+        if (url.includes(`/issues/${issueNumber}/comments`) && method === "GET") return Response.json([]);
+        if (url.includes(`/issues/${issueNumber}/comments`) && method === "POST") {
+          seen.comments.push(String(JSON.parse(String(init?.body ?? "{}")).body ?? ""));
+          return Response.json({ id: seen.comments.length }, { status: 201 });
+        }
+        return new Response("not found", { status: 404 });
+      });
+    }
+
+    function mentionPayload(issueNumber: number, body: string) {
+      return {
+        action: "created" as const,
+        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+        issue: { number: issueNumber, title: "Rate limit target", state: "open", pull_request: {}, user: { login: "oktofeesh1" }, author_association: "NONE" },
+        comment: { id: 1, body, user: { login: "maintainer", type: "User" }, author_association: "OWNER" },
+      };
+    }
+
+    it("is off by default — no invocation is tracked and every command dispatches normally", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", { number: 300, title: "Rate limit target", state: "open", user: { login: "oktofeesh1" }, author_association: "NONE", labels: [], body: "" });
+      const seen = { comments: [] as string[] };
+      stubCommandRateLimitFetch(300, seen);
+      for (let i = 0; i < 25; i += 1) {
+        await processJob(env, { type: "github-webhook", deliveryId: `rl-off-${i}`, eventName: "issue_comment", payload: mentionPayload(300, "@gittensory help") });
+      }
+      const invocations = await env.DB.prepare("select count(*) as n from audit_events where event_type = 'github_app.command_invocation'").first<{ n: number }>();
+      expect(invocations?.n).toBe(0);
+      expect(seen.comments).toHaveLength(25); // every one of the 25 invocations dispatched normally
+    });
+
+    it("records invocations under the configured threshold without holding — the normal reply still proceeds", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await upsertRepositorySettings(env, { repoFullName: "JSONbored/gittensory", commandRateLimitPolicy: "hold", commandRateLimitMaxPerWindow: 5, commandRateLimitWindowHours: 24 });
+      await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", { number: 301, title: "Rate limit target", state: "open", user: { login: "oktofeesh1" }, author_association: "NONE", labels: [], body: "" });
+      const seen = { comments: [] as string[] };
+      stubCommandRateLimitFetch(301, seen);
+      await processJob(env, { type: "github-webhook", deliveryId: "rl-under", eventName: "issue_comment", payload: mentionPayload(301, "@gittensory help") });
+      const invocations = await env.DB.prepare("select count(*) as n from audit_events where event_type = 'github_app.command_invocation'").first<{ n: number }>();
+      expect(invocations?.n).toBe(1); // 1st of 5 allowed
+      const applied = await env.DB.prepare("select count(*) as n from audit_events where event_type = 'github_app.command_rate_limit_applied'").first<{ n: number }>();
+      expect(applied?.n).toBe(0); // under threshold — no hold
+      expect(seen.comments).toHaveLength(1); // the normal answer card still posted
+    });
+
+    it("hold policy: posts a cooldown reply and short-circuits once a CHEAP command crosses its threshold", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await upsertRepositorySettings(env, { repoFullName: "JSONbored/gittensory", commandRateLimitPolicy: "hold", commandRateLimitMaxPerWindow: 3, commandRateLimitWindowHours: 24 });
+      await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", { number: 302, title: "Rate limit target", state: "open", user: { login: "oktofeesh1" }, author_association: "NONE", labels: [], body: "" });
+      for (let i = 0; i < 3; i += 1) {
+        await repositoriesModule.recordAuditEvent(env, { eventType: "github_app.command_invocation", actor: "maintainer", targetKey: "JSONbored/gittensory#302#help", outcome: "completed" });
+      }
+      const seen = { comments: [] as string[] };
+      stubCommandRateLimitFetch(302, seen);
+      await processJob(env, { type: "github-webhook", deliveryId: "rl-cheap-over", eventName: "issue_comment", payload: mentionPayload(302, "@gittensory help") });
+      // Only ONE comment posted — the short-circuit skipped the normal answer-card dispatch.
+      expect(seen.comments).toHaveLength(1);
+      expect(seen.comments[0]).toContain("rate limit");
+      const applied = await env.DB.prepare("select outcome, detail from audit_events where event_type = 'github_app.command_rate_limit_applied'").first<{ outcome: string; detail: string }>();
+      expect(applied?.outcome).toBe("completed");
+      expect(applied?.detail).toContain("hold applied");
+    });
+
+    it("an AI-cost-bearing command uses the TIGHTER commandRateLimitAiMaxPerWindow default, not the cheap-command limit", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      // Cheap-command limit left generous (20, the default); only the AI limit is tight enough to trip here.
+      await upsertRepositorySettings(env, { repoFullName: "JSONbored/gittensory", commandRateLimitPolicy: "hold", commandRateLimitAiMaxPerWindow: 2, commandRateLimitWindowHours: 24 });
+      await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", { number: 303, title: "Rate limit target", state: "open", user: { login: "oktofeesh1" }, author_association: "NONE", labels: [], body: "" });
+      for (let i = 0; i < 2; i += 1) {
+        await repositoriesModule.recordAuditEvent(env, { eventType: "github_app.command_invocation", actor: "maintainer", targetKey: "JSONbored/gittensory#303#next-action", outcome: "completed" });
+      }
+      const seen = { comments: [] as string[] };
+      stubCommandRateLimitFetch(303, seen);
+      await processJob(env, { type: "github-webhook", deliveryId: "rl-ai-over", eventName: "issue_comment", payload: mentionPayload(303, "@gittensory next-action") });
+      expect(seen.comments).toHaveLength(1);
+      expect(seen.comments[0]).toContain("rate limit");
+      const applied = await env.DB.prepare("select detail from audit_events where event_type = 'github_app.command_rate_limit_applied'").first<{ detail: string }>();
+      expect(applied?.detail).toContain("limit 2"); // the AI limit (2), not the cheap default (20)
+    });
+
+    it("commands have INDEPENDENT counters — repeatedly invoking one command never throttles a DIFFERENT command", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await upsertRepositorySettings(env, { repoFullName: "JSONbored/gittensory", commandRateLimitPolicy: "hold", commandRateLimitMaxPerWindow: 1, commandRateLimitWindowHours: 24 });
+      await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", { number: 304, title: "Rate limit target", state: "open", user: { login: "oktofeesh1" }, author_association: "NONE", labels: [], body: "" });
+      // Already at the "help" limit (1) — a further "help" invocation would be held.
+      await repositoriesModule.recordAuditEvent(env, { eventType: "github_app.command_invocation", actor: "maintainer", targetKey: "JSONbored/gittensory#304#help", outcome: "completed" });
+      const seen = { comments: [] as string[] };
+      stubCommandRateLimitFetch(304, seen);
+      // A DIFFERENT command ("miner-context") on the same thread by the same actor must not be affected.
+      await processJob(env, { type: "github-webhook", deliveryId: "rl-independent", eventName: "issue_comment", payload: mentionPayload(304, "@gittensory miner-context") });
+      expect(seen.comments).toHaveLength(1);
+      expect(seen.comments[0]).not.toContain("rate limit");
+      const applied = await env.DB.prepare("select count(*) as n from audit_events where event_type = 'github_app.command_rate_limit_applied'").first<{ n: number }>();
+      expect(applied?.n).toBe(0);
+    });
+
+    it("dry-run mode: holds the command but never posts a live cooldown comment", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await upsertRepositorySettings(env, { repoFullName: "JSONbored/gittensory", commandRateLimitPolicy: "hold", commandRateLimitMaxPerWindow: 1, commandRateLimitWindowHours: 24, agentDryRun: true });
+      await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", { number: 305, title: "Rate limit target", state: "open", user: { login: "oktofeesh1" }, author_association: "NONE", labels: [], body: "" });
+      await repositoriesModule.recordAuditEvent(env, { eventType: "github_app.command_invocation", actor: "maintainer", targetKey: "JSONbored/gittensory#305#help", outcome: "completed" });
+      const seen = { comments: [] as string[] };
+      stubCommandRateLimitFetch(305, seen);
+      await processJob(env, { type: "github-webhook", deliveryId: "rl-dry-run", eventName: "issue_comment", payload: mentionPayload(305, "@gittensory help") });
+      expect(seen.comments).toHaveLength(0); // held, but dry-run posts nothing live
+      const applied = await env.DB.prepare("select outcome from audit_events where event_type = 'github_app.command_rate_limit_applied'").first<{ outcome: string }>();
+      expect(applied?.outcome).toBe("denied");
+    });
+
+    it("REGRESSION: a redelivered webhook (same deliveryId) does not double-count — the replay is a no-op, not a second invocation", async () => {
+      // GitHub can and does redeliver the same issue_comment event (timeout/retry). Before the fix, the
+      // second delivery would increment the counter again for what is really ONE real invocation, and could
+      // incorrectly cross the rate-limit threshold on a redelivery alone.
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await upsertRepositorySettings(env, { repoFullName: "JSONbored/gittensory", commandRateLimitPolicy: "hold", commandRateLimitMaxPerWindow: 1, commandRateLimitWindowHours: 24 });
+      await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", { number: 306, title: "Rate limit target", state: "open", user: { login: "oktofeesh1" }, author_association: "NONE", labels: [], body: "" });
+      const seen = { comments: [] as string[] };
+      stubCommandRateLimitFetch(306, seen);
+      // The SAME deliveryId, redelivered — GitHub's own retry behavior on a timeout/5xx.
+      await processJob(env, { type: "github-webhook", deliveryId: "rl-redelivered", eventName: "issue_comment", payload: mentionPayload(306, "@gittensory help") });
+      await processJob(env, { type: "github-webhook", deliveryId: "rl-redelivered", eventName: "issue_comment", payload: mentionPayload(306, "@gittensory help") });
+
+      const invocations = await env.DB.prepare("select count(*) as n from audit_events where event_type = 'github_app.command_invocation'").first<{ n: number }>();
+      expect(invocations?.n).toBe(1); // only ONE invocation recorded despite two processing passes
+      expect(seen.comments).toHaveLength(1); // the replay is suppressed entirely — no second answer card
+      expect(seen.comments.every((c) => !c.includes("rate limit"))).toBe(true);
+      const suppressed = await env.DB.prepare("select count(*) as n from audit_events where event_type = 'github_app.command_redelivery_suppressed'").first<{ n: number }>();
+      expect(suppressed?.n).toBe(1);
+    });
+  });
+
   it("denies a maintainer Q&A command from an org member without real repo permission (#788)", async () => {
     const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
     await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", {
@@ -11764,6 +13130,100 @@ describe("queue processors", () => {
     expect(enqueued).not.toContainEqual(expect.objectContaining({ type: "notify-evaluate" }));
     // With no installation we cannot verify the reviewer, so no permission lookup is attempted.
     expect(permissionCalls).toEqual([]);
+  });
+
+  it.each(["submitted", "dismissed", "edited"] as const)(
+    "bumps reviewsInvalidatedAt for the right repo+PR on a pull_request_review '%s' webhook (#2537)",
+    async (action) => {
+      const env = createTestEnv({
+        GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem(),
+        JOBS: { async send() {} } as unknown as Queue,
+      });
+      vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+        const url = input.toString();
+        if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+        return new Response("not found", { status: 404 });
+      });
+      // Seed an existing sync-state row so the assertion can confirm ONLY reviewsInvalidatedAt moved.
+      await upsertPullRequestFromGitHub(env, "JSONbored/gittensory", {
+        number: 42,
+        title: "Add feature",
+        state: "open",
+        user: { login: "contributor" },
+        head: { sha: "sha-42" },
+        labels: [],
+        body: "",
+      });
+
+      await processJob(env, {
+        type: "github-webhook",
+        deliveryId: `review-invalidate-${action}`,
+        eventName: "pull_request_review",
+        payload: {
+          action,
+          installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+          repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+          pull_request: {
+            number: 42,
+            title: "Add feature",
+            state: "open",
+            user: { login: "contributor", type: "User" },
+            html_url: "https://github.com/JSONbored/gittensory/pull/42",
+          },
+          review: {
+            state: action === "dismissed" ? "DISMISSED" : "APPROVED",
+            user: { login: "maintainer", type: "User" },
+            submitted_at: "2026-05-28T12:00:00.000Z",
+            html_url: "https://github.com/JSONbored/gittensory/pull/42#pullrequestreview-1",
+          },
+          sender: { login: "maintainer", type: "User" },
+        },
+      });
+
+      const state = await getPullRequestDetailSyncState(env, "JSONbored/gittensory", 42);
+      expect(state?.reviewsInvalidatedAt).toBeTruthy();
+    },
+  );
+
+  it("does not bump reviewsInvalidatedAt for a pull_request_review action outside submitted/dismissed/edited", async () => {
+    const env = createTestEnv({
+      GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem(),
+      JOBS: { async send() {} } as unknown as Queue,
+    });
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url.includes("/access_tokens")) return Response.json({ token: "installation-token" });
+      return new Response("not found", { status: 404 });
+    });
+
+    await processJob(env, {
+      type: "github-webhook",
+      deliveryId: "review-invalidate-unsupported-action",
+      eventName: "pull_request_review",
+      payload: {
+        // "submitted" | "dismissed" | "edited" are the only invalidating actions; GitHub also emits others
+        // (e.g. review comments carry their own event) that must NOT stamp the cache marker.
+        action: "unrecognized_action" as unknown as "submitted",
+        installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+        repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+        pull_request: {
+          number: 43,
+          title: "Add feature",
+          state: "open",
+          user: { login: "contributor", type: "User" },
+          html_url: "https://github.com/JSONbored/gittensory/pull/43",
+        },
+        review: {
+          state: "APPROVED",
+          user: { login: "maintainer", type: "User" },
+          submitted_at: "2026-05-28T12:00:00.000Z",
+          html_url: "https://github.com/JSONbored/gittensory/pull/43#pullrequestreview-1",
+        },
+        sender: { login: "maintainer", type: "User" },
+      },
+    });
+
+    expect(await getPullRequestDetailSyncState(env, "JSONbored/gittensory", 43)).toBeNull();
   });
 
   it("notifies issue-watchers when a new grabbable maintainer-created issue opens (#699 path B)", async () => {
@@ -14250,5 +15710,186 @@ describe("installation app_id capture + dual-app webhook filter (#selfhost-app-i
     expect(pr?.n).toBe(1);
     const evt = await env.DB.prepare("select payload_hash from webhook_events where delivery_id = ?").bind("own-app-pr").first<{ payload_hash: string }>();
     expect(evt?.payload_hash).not.toBe("foreign_app");
+  });
+
+  // #2537: durable PR-state cache — webhook invalidation + the act-boundary regression.
+  describe("durable PR-state cache (#2537)", () => {
+    function seedWarmPrStateCache(env: Env, repoFullName: string, pullNumber: number): Promise<void> {
+      return upsertPullRequestDetailSyncState(env, {
+        repoFullName,
+        pullNumber,
+        status: "complete",
+        prMergeableState: "clean",
+        prState: "open",
+        prStateFetchedAt: new Date().toISOString(),
+      });
+    }
+
+    it.each(["synchronize", "closed", "reopened"] as const)(
+      "pull_request %s action invalidates the durable PR-state cache",
+      async (action) => {
+        const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+        await upsertInstallation(env, { action: "created", installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" }, target_type: "User", repository_selection: "all", permissions: {}, events: [] } });
+        await upsertRepositoryFromGitHub(env, { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } }, 123);
+        await upsertRepositorySettings(env, { repoFullName: "JSONbored/gittensory", gateCheckMode: "off", checkRunMode: "off", commentMode: "off", publicSurface: "off" });
+        await seedWarmPrStateCache(env, "JSONbored/gittensory", 200);
+        vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+          const url = input.toString();
+          if (url.includes("/access_tokens")) return Response.json({ token: "tok" });
+          return Response.json({});
+        });
+
+        await processJob(env, {
+          type: "github-webhook",
+          deliveryId: `invalidate-pr-state-${action}`,
+          eventName: "pull_request",
+          payload: {
+            action,
+            installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+            repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+            pull_request: { number: 200, title: "PR", state: action === "closed" ? "closed" : "open", user: { login: "contributor" }, head: { sha: "a200" }, labels: [], body: "" },
+          },
+        });
+
+        expect(await getPullRequestDetailSyncState(env, "JSONbored/gittensory", 200)).toMatchObject({
+          prMergeableState: null,
+          prState: null,
+          prStateFetchedAt: null,
+        });
+      },
+    );
+
+    it("a non-invalidating pull_request action (labeled) leaves the durable PR-state cache UNCHANGED", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await upsertInstallation(env, { action: "created", installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" }, target_type: "User", repository_selection: "all", permissions: {}, events: [] } });
+      await upsertRepositoryFromGitHub(env, { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } }, 123);
+      await upsertRepositorySettings(env, { repoFullName: "JSONbored/gittensory", gateCheckMode: "off", checkRunMode: "off", commentMode: "off", publicSurface: "off" });
+      await seedWarmPrStateCache(env, "JSONbored/gittensory", 201);
+      vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+        const url = input.toString();
+        if (url.includes("/access_tokens")) return Response.json({ token: "tok" });
+        return Response.json({});
+      });
+
+      await processJob(env, {
+        type: "github-webhook",
+        deliveryId: "invalidate-pr-state-labeled",
+        eventName: "pull_request",
+        payload: {
+          action: "labeled",
+          installation: { id: 123, account: { login: "JSONbored", id: 1, type: "User" } },
+          repository: { name: "gittensory", full_name: "JSONbored/gittensory", private: false, owner: { login: "JSONbored" } },
+          pull_request: { number: 201, title: "PR", state: "open", user: { login: "contributor" }, head: { sha: "a201" }, labels: [], body: "" },
+        },
+      });
+
+      expect(await getPullRequestDetailSyncState(env, "JSONbored/gittensory", 201)).toMatchObject({
+        prMergeableState: "clean",
+        prState: "open",
+      });
+    });
+
+    it("REGRESSION (#2537, gate-flagged): reconcileLiveDuplicateSiblings must NOT serve a warm durable PR-state cache row — a cached 'open' read up to PR_STATE_CACHE_MAX_AGE_MS stale after a missed closed webhook would keep an already-closed sibling eligible as the duplicate-cluster winner, wrongly closing the CURRENT PR as the loser", async () => {
+      const env = createTestEnv({ GITTENSORY_DUPLICATE_WINNER: "true" });
+      // Seed a WARM cache row claiming the sibling is still open, but the live GitHub state below says CLOSED —
+      // proving the cache is never consulted: only a genuine live read can discover this and correctly reconcile it.
+      await seedWarmPrStateCache(env, "owner/repo", 5);
+      let liveStateFetches = 0;
+      vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+        const url = input.toString();
+        if (url.includes("/access_tokens")) return Response.json({ token: "tok" });
+        if (/\/pulls\/5(?:\?|$)/.test(url)) {
+          liveStateFetches += 1;
+          return Response.json({ number: 5, state: "closed" });
+        }
+        return Response.json({});
+      });
+
+      const winner: Parameters<typeof reconcileLiveDuplicateSiblings>[3] = { repoFullName: "owner/repo", number: 10, title: "Winner", state: "open", labels: [], linkedIssues: [1] };
+      const sibling: Parameters<typeof reconcileLiveDuplicateSiblings>[3] = { repoFullName: "owner/repo", number: 5, title: "Sibling", state: "open", labels: [], linkedIssues: [1] };
+      const result = await reconcileLiveDuplicateSiblings(env, null, "owner/repo", winner, [sibling]);
+
+      // The sibling is correctly dropped as stale-closed, proving a genuine live fetch happened rather than
+      // trusting the warm-but-wrong cached "open" value.
+      expect(result).toEqual([]);
+      expect(liveStateFetches).toBe(1);
+    });
+
+    it("REGRESSION (#2537): the per-PR sweep unit's live resync primes the durable PR-state cache for later readers", async () => {
+      const env = createTestEnv({ GITHUB_APP_PRIVATE_KEY: await generatePrivateKeyPem() });
+      await upsertInstallation(env, { action: "created", installation: { id: 9001, account: { login: "owner", id: 1, type: "Organization" }, target_type: "Organization", repository_selection: "selected", permissions: { pull_requests: "write" }, events: [] } });
+      await upsertRepositoryFromGitHub(env, { name: "agent-repo", full_name: "owner/agent-repo", private: false, owner: { login: "owner" } }, 9001);
+      await upsertRepositorySettings(env, { repoFullName: "owner/agent-repo", gateCheckMode: "off", checkRunMode: "off", commentMode: "off", publicSurface: "off" });
+      await upsertPullRequestFromGitHub(env, "owner/agent-repo", { number: 6, title: "Sweep target", state: "open", user: { login: "contributor" }, head: { sha: "a6" }, base: { ref: "main" }, labels: [], body: "" });
+      vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+        const url = input.toString();
+        if (url.includes("/access_tokens")) return Response.json({ token: "tok" });
+        if (/\/pulls\/6(?:\?|$)/.test(url)) return Response.json({ number: 6, state: "open", mergeable_state: "clean", head: { sha: "a6" } });
+        if (url.includes("/pulls/6/files")) return Response.json([]);
+        if (url.includes("/pulls/6/reviews")) return Response.json([]);
+        if (url.includes("/commits/a6/check-runs")) return Response.json({ total_count: 0, check_runs: [] });
+        if (url.includes("/commits/a6/status")) return Response.json({ state: "success", statuses: [] });
+        if (url.includes("/branches/")) return Response.json({ protected: false, protection: { required_status_checks: { contexts: [] } } });
+        return Response.json({});
+      });
+
+      await processJob(env, { type: "agent-regate-pr", deliveryId: "prime-pr-state-cache", repoFullName: "owner/agent-repo", prNumber: 6, installationId: 9001 });
+
+      expect(await getPullRequestDetailSyncState(env, "owner/agent-repo", 6)).toMatchObject({
+        prMergeableState: "clean",
+        prState: "open",
+      });
+    });
+  });
+});
+
+describe("enrichOpenPullRequestsWithChangedFiles (#2653)", () => {
+  const pr = (number: number, overrides: Partial<PullRequestRecord> = {}): PullRequestRecord => ({
+    repoFullName: "owner/repo",
+    number,
+    title: `PR ${number}`,
+    state: "open",
+    labels: [],
+    linkedIssues: [],
+    ...overrides,
+  });
+
+  it("populates changedFiles for open PRs from the pull_request_files cache", async () => {
+    const env = createTestEnv();
+    await upsertPullRequestFile(env, { repoFullName: "owner/repo", pullNumber: 10, path: "src/a.ts", additions: 1, deletions: 0, changes: 1, payload: {} });
+    await upsertPullRequestFile(env, { repoFullName: "owner/repo", pullNumber: 10, path: "src/b.ts", additions: 1, deletions: 0, changes: 1, payload: {} });
+    await upsertPullRequestFile(env, { repoFullName: "owner/repo", pullNumber: 11, path: "src/c.ts", additions: 1, deletions: 0, changes: 1, payload: {} });
+
+    const result = await enrichOpenPullRequestsWithChangedFiles(env, "owner/repo", [pr(10), pr(11)]);
+
+    expect(result.find((candidate) => candidate.number === 10)?.changedFiles?.sort()).toEqual(["src/a.ts", "src/b.ts"]);
+    expect(result.find((candidate) => candidate.number === 11)?.changedFiles).toEqual(["src/c.ts"]);
+  });
+
+  it("leaves a PR's changedFiles untouched when the cache has no rows for it (fail-safe degrade, not an error)", async () => {
+    const env = createTestEnv();
+    await upsertPullRequestFile(env, { repoFullName: "owner/repo", pullNumber: 10, path: "src/a.ts", additions: 1, deletions: 0, changes: 1, payload: {} });
+
+    const result = await enrichOpenPullRequestsWithChangedFiles(env, "owner/repo", [pr(10), pr(12)]);
+
+    expect(result.find((candidate) => candidate.number === 12)?.changedFiles).toBeUndefined();
+  });
+
+  it("does not query the cache and returns the same array reference when there are no open PRs", async () => {
+    const env = createTestEnv();
+    const input = [pr(20, { state: "closed" })];
+
+    const result = await enrichOpenPullRequestsWithChangedFiles(env, "owner/repo", input);
+
+    expect(result).toBe(input);
+  });
+
+  it("returns the same array reference when the cache has no rows for any open PR", async () => {
+    const env = createTestEnv();
+    const input = [pr(30)];
+
+    const result = await enrichOpenPullRequestsWithChangedFiles(env, "owner/repo", input);
+
+    expect(result).toBe(input);
   });
 });

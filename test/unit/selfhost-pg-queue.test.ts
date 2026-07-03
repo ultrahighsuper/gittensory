@@ -58,12 +58,17 @@ interface MockPool {
   /** Pre-load a job to be returned by the next RETURNING claim query. */
   enqueueJob(id: string, payload: object, attempts?: number, jobKey?: string | null): void;
   setDeferUpdateRowCount(rowCount: number): void;
+  /** Queues per-call rowCounts for the "AND status='dead'" revive UPDATE, one entry consumed per call in order
+   *  (default 1 when the queue is empty) — lets a test simulate an overlapping reviver already winning the race
+   *  on a specific row (rowCount 0) while another succeeds (rowCount 1). */
+  setReviveUpdateRowCounts(rowCounts: number[]): void;
   setRateLimitRows(rows: Array<{ admission_key?: string | null; repo_full_name?: string | null; remaining: number | string | null; reset_at: string | null; observed_at?: string | null }>): void;
 }
 
 function makePool(): MockPool {
   const results: Partial<QueryResult>[] = [];
   let deferUpdateRowCount = 1;
+  const reviveUpdateRowCounts: number[] = [];
   let rateLimitRows: Array<{ admission_key?: string | null; repo_full_name?: string | null; remaining: number | string | null; reset_at: string | null; observed_at?: string | null }> = [];
   const fn = vi.fn().mockImplementation(async (sql: unknown, params?: unknown[]) => {
     const q = String(sql);
@@ -83,6 +88,10 @@ function makePool(): MockPool {
     }
     if (q.includes("SET status='pending', run_after=GREATEST")) {
       return { rows: [], rowCount: deferUpdateRowCount };
+    }
+    if (q.includes("SET status='pending', run_after=$1, last_error=NULL")) {
+      const rowCount = reviveUpdateRowCounts.length > 0 ? (reviveUpdateRowCounts.shift() ?? 1) : 1;
+      return { rows: [], rowCount };
     }
     // Claim queries use RETURNING — pop from queue; fall through to empty default otherwise.
     if (q.includes("RETURNING")) {
@@ -104,6 +113,10 @@ function makePool(): MockPool {
     },
     setDeferUpdateRowCount(rowCount) {
       deferUpdateRowCount = rowCount;
+    },
+    setReviveUpdateRowCounts(rowCounts) {
+      reviveUpdateRowCounts.length = 0;
+      reviveUpdateRowCounts.push(...rowCounts);
     },
     setRateLimitRows(rows) {
       rateLimitRows = rows;
@@ -912,6 +925,113 @@ describe("createPgQueue (durable #977)", () => {
     await q.drain();
     await q.drain(); // second drain processes the retried job
     expect(calls).toBe(2);
+  });
+
+  describe("reviveDeadLetterJobs (#audit-rate-headroom)", () => {
+    afterEach(() => {
+      delete process.env.QUEUE_DEAD_LETTER_AUTO_RETRY_MAX_EXTRA_ATTEMPTS;
+    });
+
+    it("requeues dead jobs still under the auto-retry ceiling, clearing last_error, and records the metric", async () => {
+      process.env.QUEUE_DEAD_LETTER_AUTO_RETRY_MAX_EXTRA_ATTEMPTS = "2";
+      const m = makePool();
+      m.fn.mockResolvedValueOnce({
+        rows: [
+          { id: "1", payload: JSON.stringify({ type: "t" }), job_key: null },
+          { id: "2", payload: JSON.stringify({ type: "t" }), job_key: "k" },
+        ],
+        rowCount: 2,
+      }); // SELECT status='dead' AND attempts<ceiling
+      const q = createPgQueue(m.pool, async () => undefined, { maxRetries: 1 });
+
+      const revived = await q.reviveDeadLetterJobs();
+
+      expect(revived).toBe(2);
+      // The SELECT was bound to the ceiling (maxRetries=1 + extra=2 = 3), not a raw maxRetries.
+      expect(m.fn).toHaveBeenCalledWith(expect.stringContaining("status='dead' AND attempts<$1"), [3]);
+      // Each eligible row is revived to pending with last_error cleared -- not a fresh retry budget (attempts
+      // is never touched here).
+      expect(m.fn).toHaveBeenCalledWith(
+        expect.stringContaining("SET status='pending', run_after=$1, last_error=NULL"),
+        expect.arrayContaining(["1"]),
+      );
+      expect(m.fn).toHaveBeenCalledWith(
+        expect.stringContaining("SET status='pending', run_after=$1, last_error=NULL"),
+        expect.arrayContaining(["2"]),
+      );
+      expect(await renderMetrics()).toContain("gittensory_jobs_dead_letter_revived_total 2");
+    });
+
+    it("is a no-op (and records nothing) when no dead job is under the ceiling", async () => {
+      const m = makePool();
+      m.fn.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+      const q = createPgQueue(m.pool, async () => undefined, { maxRetries: 1 });
+
+      const revived = await q.reviveDeadLetterJobs();
+
+      expect(revived).toBe(0);
+      expect(await renderMetrics()).not.toContain("gittensory_jobs_dead_letter_revived_total");
+    });
+
+    // REGRESSION (#2581 review defect): the SELECT is a stale snapshot. Without an "AND status='dead'" re-check on
+    // the UPDATE, an overlapping reviver (another self-host instance, or a slow prior tick still running when the
+    // next one fires) that already moved a row out of 'dead' -- e.g. into 'processing' via a normal claim -- would
+    // get silently flipped back to 'pending' by this stale UPDATE, letting the job run a second time concurrently.
+    it("does NOT count a row as revived when another reviver already moved it out of 'dead' (rowCount 0) -- only the row that actually changed status counts", async () => {
+      const m = makePool();
+      m.fn.mockResolvedValueOnce({
+        rows: [
+          { id: "1", payload: JSON.stringify({ type: "t" }), job_key: null },
+          { id: "2", payload: JSON.stringify({ type: "t" }), job_key: "k" },
+        ],
+        rowCount: 2,
+      }); // SELECT status='dead' AND attempts<ceiling -- a stale snapshot of both rows
+      // Row "1" lost the race (another reviver/claim already moved it out of 'dead' -- UPDATE affects 0 rows);
+      // row "2" is still genuinely dead and gets revived.
+      m.setReviveUpdateRowCounts([0, 1]);
+      const q = createPgQueue(m.pool, async () => undefined, { maxRetries: 1 });
+
+      const revived = await q.reviveDeadLetterJobs();
+
+      // Only the ONE row whose UPDATE actually matched (still 'dead' at UPDATE time) counts -- not the raw SELECT
+      // count of 2, which would have double-counted the row another reviver already claimed.
+      expect(revived).toBe(1);
+      expect(m.fn).toHaveBeenCalledWith(
+        expect.stringContaining("SET status='pending', run_after=$1, last_error=NULL WHERE id=$2 AND status='dead'"),
+        expect.arrayContaining(["1"]),
+      );
+      expect(m.fn).toHaveBeenCalledWith(
+        expect.stringContaining("SET status='pending', run_after=$1, last_error=NULL WHERE id=$2 AND status='dead'"),
+        expect.arrayContaining(["2"]),
+      );
+      expect(await renderMetrics()).toContain("gittensory_jobs_dead_letter_revived_total 1");
+    });
+
+    // REGRESSION (#2581 review defect): the revive interval had no error handler of its own, so a thrown
+    // pool/metric failure on that tick would surface as an unhandled promise rejection and could terminate the
+    // process -- exactly the failure mode pump()'s own try/catch already guards against for the main poll loop.
+    it("survives a reviveDeadLetterJobs() pool failure on the interval tick instead of crashing the process", async () => {
+      process.env.QUEUE_DEAD_LETTER_REVIVE_INTERVAL_MS = "1000";
+      vi.useFakeTimers();
+      try {
+        const fn = vi.fn().mockImplementation(async (sql: unknown) => {
+          if (String(sql).includes("WHERE status='dead' AND attempts<$1")) throw new Error("connection terminated unexpectedly");
+          return { rows: [], rowCount: 0 };
+        });
+        const pool = { query: fn } as unknown as Pool;
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+        const q = createPgQueue(pool, async () => undefined, { maxRetries: 1 });
+
+        q.start();
+        await vi.advanceTimersByTimeAsync(1000); // the revive interval fires once
+
+        const logged = errorSpy.mock.calls.map(([line]) => String(line));
+        expect(logged.some((line) => line.includes("selfhost_queue_dead_letter_revive_crashed") && line.includes("connection terminated unexpectedly"))).toBe(true);
+        await q.stop();
+      } finally {
+        delete process.env.QUEUE_DEAD_LETTER_REVIVE_INTERVAL_MS;
+      }
+    });
   });
 
   it("reschedules GitHub rate-limit failures without consuming the dead-letter budget", async () => {

@@ -57,6 +57,7 @@ import {
   upstreamSourceSnapshots,
   webhookEvents,
 } from "./schema";
+import { MAX_REVIEW_NAG_COOLDOWN_DAYS } from "../settings/agent-actions";
 import type {
   Advisory,
   AdvisoryFinding,
@@ -510,6 +511,13 @@ export async function getRepositorySettings(env: Env, fullName: string): Promise
       reviewNagCooldownDays: 5,
       reviewNagLabel: "review-nag-cooldown",
       autoCloseExemptLogins: [],
+      requireFreshRebaseWindowMinutes: null,
+      accountAgeThresholdDays: null,
+      newAccountLabel: "new-account",
+      commandRateLimitPolicy: "off",
+      commandRateLimitMaxPerWindow: 20,
+      commandRateLimitAiMaxPerWindow: 5,
+      commandRateLimitWindowHours: 24,
     };
   }
   return {
@@ -559,9 +567,16 @@ export async function getRepositorySettings(env: Env, fullName: string): Promise
     contributorCapLabel: row.contributorCapLabel,
     reviewNagPolicy: normalizeReviewNagPolicy(row.reviewNagPolicy),
     reviewNagMaxPings: normalizePositiveIntWithDefault(row.reviewNagMaxPings, 3),
-    reviewNagCooldownDays: normalizePositiveIntWithDefault(row.reviewNagCooldownDays, 5),
+    reviewNagCooldownDays: normalizeReviewNagCooldownDays(row.reviewNagCooldownDays, 5),
     reviewNagLabel: row.reviewNagLabel,
     autoCloseExemptLogins: parseAutoCloseExemptLogins(row.autoCloseExemptLoginsJson),
+    requireFreshRebaseWindowMinutes: normalizeOpenItemCap(row.requireFreshRebaseWindowMinutes),
+    accountAgeThresholdDays: normalizeOpenItemCap(row.accountAgeThresholdDays),
+    newAccountLabel: row.newAccountLabel,
+    commandRateLimitPolicy: normalizeCommandRateLimitPolicy(row.commandRateLimitPolicy),
+    commandRateLimitMaxPerWindow: normalizePositiveIntWithDefault(row.commandRateLimitMaxPerWindow, 20),
+    commandRateLimitAiMaxPerWindow: normalizePositiveIntWithDefault(row.commandRateLimitAiMaxPerWindow, 5),
+    commandRateLimitWindowHours: normalizePositiveIntWithDefault(row.commandRateLimitWindowHours, 24),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -643,9 +658,16 @@ export async function upsertRepositorySettings(env: Env, settings: Partial<Repos
     contributorCapLabel: settings.contributorCapLabel ?? "over-contributor-limit",
     reviewNagPolicy: normalizeReviewNagPolicy(settings.reviewNagPolicy),
     reviewNagMaxPings: normalizePositiveIntWithDefault(settings.reviewNagMaxPings, 3),
-    reviewNagCooldownDays: normalizePositiveIntWithDefault(settings.reviewNagCooldownDays, 5),
+    reviewNagCooldownDays: normalizeReviewNagCooldownDays(settings.reviewNagCooldownDays, 5),
     reviewNagLabel: settings.reviewNagLabel ?? "review-nag-cooldown",
     autoCloseExemptLogins: normalizeAutoCloseExemptLogins(settings.autoCloseExemptLogins).logins,
+    requireFreshRebaseWindowMinutes: normalizeOpenItemCap(settings.requireFreshRebaseWindowMinutes),
+    accountAgeThresholdDays: normalizeOpenItemCap(settings.accountAgeThresholdDays),
+    newAccountLabel: settings.newAccountLabel ?? "new-account",
+    commandRateLimitPolicy: normalizeCommandRateLimitPolicy(settings.commandRateLimitPolicy),
+    commandRateLimitMaxPerWindow: normalizePositiveIntWithDefault(settings.commandRateLimitMaxPerWindow, 20),
+    commandRateLimitAiMaxPerWindow: normalizePositiveIntWithDefault(settings.commandRateLimitAiMaxPerWindow, 5),
+    commandRateLimitWindowHours: normalizePositiveIntWithDefault(settings.commandRateLimitWindowHours, 24),
   };
   const db = getDb(env.DB);
   await db
@@ -700,6 +722,13 @@ export async function upsertRepositorySettings(env: Env, settings: Partial<Repos
       reviewNagCooldownDays: resolved.reviewNagCooldownDays,
       reviewNagLabel: resolved.reviewNagLabel,
       autoCloseExemptLoginsJson: jsonString(resolved.autoCloseExemptLogins),
+      requireFreshRebaseWindowMinutes: resolved.requireFreshRebaseWindowMinutes,
+      accountAgeThresholdDays: resolved.accountAgeThresholdDays,
+      newAccountLabel: resolved.newAccountLabel,
+      commandRateLimitPolicy: resolved.commandRateLimitPolicy,
+      commandRateLimitMaxPerWindow: resolved.commandRateLimitMaxPerWindow,
+      commandRateLimitAiMaxPerWindow: resolved.commandRateLimitAiMaxPerWindow,
+      commandRateLimitWindowHours: resolved.commandRateLimitWindowHours,
       updatedAt: nowIso(),
     })
     .onConflictDoUpdate({
@@ -755,6 +784,13 @@ export async function upsertRepositorySettings(env: Env, settings: Partial<Repos
         reviewNagCooldownDays: resolved.reviewNagCooldownDays,
         reviewNagLabel: resolved.reviewNagLabel,
         autoCloseExemptLoginsJson: jsonString(resolved.autoCloseExemptLogins),
+        requireFreshRebaseWindowMinutes: resolved.requireFreshRebaseWindowMinutes,
+        accountAgeThresholdDays: resolved.accountAgeThresholdDays,
+        newAccountLabel: resolved.newAccountLabel,
+        commandRateLimitPolicy: resolved.commandRateLimitPolicy,
+        commandRateLimitMaxPerWindow: resolved.commandRateLimitMaxPerWindow,
+        commandRateLimitAiMaxPerWindow: resolved.commandRateLimitAiMaxPerWindow,
+        commandRateLimitWindowHours: resolved.commandRateLimitWindowHours,
         updatedAt: nowIso(),
       },
     });
@@ -1133,8 +1169,10 @@ export async function getRepoQueueTrendSnapshot(env: Env, repoFullName: string):
 // drizzle's `onConflictDoUpdate` strips `undefined` entries from the generated SQL `SET` clause rather than
 // writing NULL. Every "running" pre-fetch stamp (backfill.ts) relies on this to touch only `status` without
 // clearing the PREVIOUS `headSha`/`*SyncedAt` row — including the repo+PR+headSha file cache
-// (#audit-rate-headroom), which would silently stop hitting if a future edit here coalesced an omitted field to
-// `null` (e.g. `headSha: state.headSha ?? null`). Pass `null` explicitly to actually clear a column.
+// (#audit-rate-headroom) and the durable bare-PR-state cache (#2537), which would silently stop hitting if a
+// future edit here coalesced an omitted field to `null` (e.g. `headSha: state.headSha ?? null`). Pass `null`
+// explicitly to actually clear a column (this is exactly how webhook invalidation clears prMergeableState/prState
+// below).
 export async function upsertPullRequestDetailSyncState(env: Env, state: PullRequestDetailSyncStateRecord): Promise<void> {
   const db = getDb(env.DB);
   await db
@@ -1147,9 +1185,13 @@ export async function upsertPullRequestDetailSyncState(env: Env, state: PullRequ
       headSha: state.headSha,
       filesSyncedAt: state.filesSyncedAt,
       reviewsSyncedAt: state.reviewsSyncedAt,
+      reviewsInvalidatedAt: state.reviewsInvalidatedAt,
       checksSyncedAt: state.checksSyncedAt,
       lastSyncedAt: state.lastSyncedAt,
       errorSummary: state.errorSummary,
+      prMergeableState: state.prMergeableState,
+      prState: state.prState,
+      prStateFetchedAt: state.prStateFetchedAt,
       updatedAt: nowIso(),
     })
     .onConflictDoUpdate({
@@ -1159,12 +1201,60 @@ export async function upsertPullRequestDetailSyncState(env: Env, state: PullRequ
         headSha: state.headSha,
         filesSyncedAt: state.filesSyncedAt,
         reviewsSyncedAt: state.reviewsSyncedAt,
+        reviewsInvalidatedAt: state.reviewsInvalidatedAt,
         checksSyncedAt: state.checksSyncedAt,
         lastSyncedAt: state.lastSyncedAt,
         errorSummary: state.errorSummary,
+        prMergeableState: state.prMergeableState,
+        prState: state.prState,
+        prStateFetchedAt: state.prStateFetchedAt,
         updatedAt: nowIso(),
       },
     });
+}
+
+/** Reviews-cache invalidation stamp (#2537): a pure single-field bump of `reviewsInvalidatedAt`, leaving
+ *  every other column (`headSha`/`filesSyncedAt`/`reviewsSyncedAt`/`checksSyncedAt`/...) untouched when the
+ *  row already exists — mirrors the narrow single-field touches on `pull_requests` (markPullRequestApproved,
+ *  markPullRequestRegated). Creates the row (all other columns default/NULL) if this repo+PR has never been
+ *  synced yet, so an early review webhook is not silently dropped.
+ *
+ *  Unlike its siblings above (advisory/reporting markers with other fallback signals), this write is the SOLE
+ *  source of the reviews-cache invalidation signal (#2537 gate finding) — a single failed attempt loses that
+ *  PR's specific "reviews changed" event permanently, with nothing to naturally re-trigger it until some LATER
+ *  invalidation happens to succeed. The caller already treats this as best-effort (never blocks the webhook),
+ *  so a short bounded retry absorbs a transient D1 blip in-process rather than needing a durable retry queue
+ *  for what is still, even after this, a best-effort write. */
+export async function markPullRequestReviewsInvalidated(env: Env, repoFullName: string, pullNumber: number): Promise<void> {
+  const db = getDb(env.DB);
+  const now = nowIso();
+  const MAX_ATTEMPTS = 3;
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    try {
+      await db
+        .insert(pullRequestDetailSyncState)
+        .values({
+          id: `${repoFullName}#${pullNumber}`,
+          repoFullName,
+          pullNumber,
+          status: "never_synced",
+          reviewsInvalidatedAt: now,
+          updatedAt: now,
+        })
+        .onConflictDoUpdate({
+          target: [pullRequestDetailSyncState.repoFullName, pullRequestDetailSyncState.pullNumber],
+          set: {
+            reviewsInvalidatedAt: now,
+            updatedAt: now,
+          },
+        });
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
 }
 
 export async function getPullRequestDetailSyncState(env: Env, fullName: string, pullNumber: number): Promise<PullRequestDetailSyncStateRecord | null> {
@@ -2224,6 +2314,36 @@ export async function countRecentAuditEventsForActorAndTarget(env: Env, actor: s
   return row.count;
 }
 
+/** Whether `deliveryId` has ALREADY been recorded for this (actor, eventType, targetKey) within `sinceIso` --
+ *  makes a counting/rate-limit check idempotent against a REDELIVERED or retried webhook event (GitHub can
+ *  and does redeliver the same issue_comment event), which would otherwise increment the counter twice for
+ *  one real invocation and can incorrectly rate-limit it (#2560). Scoped to a short recent window, not the
+ *  full rate-limit window -- a genuine redelivery lands within seconds, not hours later.
+ *  Gate review finding: an earlier version matched deliveryId IN MEMORY over a `.limit(50)` slice with no
+ *  ORDER BY -- once an actor accumulated more than 50 matching rows within the window (a burst/spam scenario,
+ *  exactly what this feature exists to handle), the row carrying the original deliveryId could be excluded
+ *  from that arbitrary slice, producing a false negative right when it matters most. The deliveryId match is
+ *  now pushed into the SQL predicate itself (json_extract on metadataJson, mirroring
+ *  countRecentDeadLettersByType's own json_extract usage below), so it's an exact match against every row in
+ *  the window regardless of how many other rows exist for this actor/event/target. */
+export async function hasAuditEventForDelivery(env: Env, actor: string, eventType: string, targetKey: string, deliveryId: string, sinceIso: string): Promise<boolean> {
+  const db = getDb(env.DB);
+  const [row] = await db
+    .select({ count: sql<number>`count(*)` })
+    .from(auditEvents)
+    .where(
+      and(
+        eq(auditEvents.actor, actor),
+        eq(auditEvents.eventType, eventType),
+        eq(auditEvents.targetKey, targetKey),
+        gte(auditEvents.createdAt, sinceIso),
+        sql`json_extract(${auditEvents.metadataJson}, '$.deliveryId') = ${deliveryId}`,
+      ),
+    );
+  /* v8 ignore next -- count(*) always returns exactly one row; the empty-array guard only satisfies the destructure type. */
+  return (row?.count ?? 0) > 0;
+}
+
 /** Observability for the queue dead-letter rate (#1276): how many jobs (across BOTH the maintenance and webhook
  *  lanes) were dead-lettered since `sinceIso`. Reads the `github_app.dlq_dead_lettered` audit events written by
  *  processDlqBatch — NOT gated behind any review-ops flag, so the infra drop rate is always visible. */
@@ -2236,6 +2356,25 @@ export async function countRecentDeadLetters(env: Env, sinceIso: string): Promis
   /* v8 ignore next -- count(*) always returns exactly one row; the empty-array guard only satisfies the destructure type. */
   if (!row) return 0;
   return row.count;
+}
+
+/** Observability for the DLQ dashboard (#1208): recent dead letters grouped by job type, using the jobType stored
+ *  in each `github_app.dlq_dead_lettered` audit event's metadata. Missing/blank jobType falls back to `unknown`,
+ *  and the returned object's keys are sorted deterministically for stable consumers/tests. */
+export async function countRecentDeadLettersByType(env: Env, sinceIso: string): Promise<Record<string, number>> {
+  const db = getDb(env.DB);
+  const jobTypeExpr =
+    sql<string>`coalesce(nullif(trim(cast(json_extract(${auditEvents.metadataJson}, '$.jobType') as text)), ''), 'unknown')`;
+  const rows = await db
+    .select({
+      jobType: jobTypeExpr,
+      count: sql<number>`count(*)`,
+    })
+    .from(auditEvents)
+    .where(and(eq(auditEvents.eventType, "github_app.dlq_dead_lettered"), gte(auditEvents.createdAt, sinceIso)))
+    .groupBy(jobTypeExpr)
+    .orderBy(asc(jobTypeExpr));
+  return Object.fromEntries(rows.map((row) => [row.jobType, Number(row.count)]));
 }
 
 export type PrVisibilitySkipAuditEvent = {
@@ -3066,8 +3205,15 @@ export async function upsertPullRequestFile(env: Env, file: PullRequestFileRecor
       payloadJson: jsonString(file.payload),
       updatedAt: nowIso(),
     })
+    // Target the PRIMARY KEY, not the (repoFullName, pullNumber, path) unique index it's derived from. `id`
+    // is a pure function of those same 3 fields, so under a single execution the two are always in lockstep —
+    // but on the self-host Postgres backend, ON CONFLICT only protects against a race on the SPECIFIED arbiter
+    // index; a genuinely concurrent second writer (e.g. two overlapping detail-sync passes for the same PR,
+    // both racing past the "no existing row yet" check) can still hit a raw duplicate-key error on `id` because
+    // that constraint isn't the one Postgres is arbitrating. Targeting `id` directly makes Postgres's upsert
+    // machinery cover the constraint that's actually racing.
     .onConflictDoUpdate({
-      target: [pullRequestFiles.repoFullName, pullRequestFiles.pullNumber, pullRequestFiles.path],
+      target: pullRequestFiles.id,
       set: {
         status: file.status,
         additions: file.additions,
@@ -4214,9 +4360,13 @@ function toPullRequestDetailSyncStateRecord(row: typeof pullRequestDetailSyncSta
     headSha: row.headSha,
     filesSyncedAt: row.filesSyncedAt,
     reviewsSyncedAt: row.reviewsSyncedAt,
+    reviewsInvalidatedAt: row.reviewsInvalidatedAt,
     checksSyncedAt: row.checksSyncedAt,
     lastSyncedAt: row.lastSyncedAt,
     errorSummary: row.errorSummary,
+    prMergeableState: row.prMergeableState,
+    prState: row.prState,
+    prStateFetchedAt: row.prStateFetchedAt,
     updatedAt: row.updatedAt,
   };
 }
@@ -5691,12 +5841,21 @@ function normalizeReviewNagPolicy(value: string | null | undefined): "off" | "ho
   return value === "hold" || value === "close" ? value : "off";
 }
 
+function normalizeCommandRateLimitPolicy(value: string | null | undefined): "off" | "hold" {
+  return value === "hold" ? value : "off";
+}
+
 // A review-nag threshold/window is a discrete positive count, not a score — reuses the same non-clamping,
 // non-rounding shape as contributorOpenPrCap's normalizeOpenItemCap (#2270): an invalid value (fractional,
 // non-positive, non-finite) falls back to the given default rather than being silently coerced.
 function normalizePositiveIntWithDefault(value: number | null | undefined, fallback: number): number {
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) return fallback;
   return value;
+}
+
+function normalizeReviewNagCooldownDays(value: number | null | undefined, fallback: number): number {
+  const normalized = normalizePositiveIntWithDefault(value, fallback);
+  return Math.min(normalized, MAX_REVIEW_NAG_COOLDOWN_DAYS);
 }
 
 function parseAutonomyPolicy(value: string): AutonomyPolicy {

@@ -470,6 +470,11 @@ export type PullRequestRecord = {
    *  stale-surface diagnostics, not as a hard re-review skip: GitHub comments/checks can still be stale or partial
    *  while this marker matches headSha. Publish-written; read straight from the row. */
   lastPublishedSurfaceSha?: string | null | undefined;
+  /** File paths changed by this open PR, when the caller has already resolved them (e.g. from the
+   *  `pull_request_files` cache). Absent/undefined when not resolved — callers must not assume an empty array
+   *  means "no files changed". Mirrors {@link RecentMergedPullRequestRecord.changedFiles} so the same
+   *  collision/preflight path-overlap scoring works for open PRs, not just merged history. */
+  changedFiles?: string[] | undefined;
 };
 
 export type IssueRecord = {
@@ -536,6 +541,14 @@ export type RepositorySettings = {
    *  advisory sub-gate promoted to block) WITHOUT enforcing — the posted check stays non-blocking. Lets advisory mode
    *  preview exactly what it would do before the maintainer flips to real enforcement. Default off. */
   gateDryRun?: boolean | undefined;
+  /** Live premerge migrations/** collision recheck (#2550). When true, an agent-driven merge of a PR that
+   *  touches migrations/** is preceded by a fresh GitHub Trees-API read of the base branch's CURRENT migration
+   *  filenames — unioned with this PR's own new migration filenames — checked for a live numeric collision.
+   *  A collision suppresses the merge and holds the PR with a rebase-needed label + comment instead of merging
+   *  blind. Config-as-code only (no DB column, mirrors gateDryRun) — set via `.gittensory.yml`
+   *  `gate.premergeContentRecheck`. Default off/undefined — opt-in, since it costs one extra, uncached
+   *  GitHub API call for any PR that touches migrations/**. */
+  premergeContentRecheck?: boolean | undefined;
   /** Merge-readiness gate (#merge-readiness). `off`/`advisory`/`block`. No min-score. Default `off`. */
   mergeReadinessGateMode: GateRuleMode;
   /** Focus-manifest policy gate (#555). When `block`, the focus manifest's declared policy (blocked paths,
@@ -651,6 +664,45 @@ export type RepositorySettings = {
    *  on top of the standing owner/admin/automation-bot exemption. Always populated by the DB layer (default
    *  `[]`); optional so existing settings fixtures/callers need not be touched. */
   autoCloseExemptLogins?: string[] | undefined;
+  /** Force-rebase-before-merge window in minutes (#2552, anti-race). When a base branch has advanced within
+   *  this many minutes of the actual merge-decision moment, an agent-driven merge forces an `update_branch` +
+   *  fresh CI recheck cycle first, rather than trusting a `mergeableState: clean` read that may already be
+   *  stale relative to a sibling commit that just landed on the base. `null`/undefined (default) = never
+   *  force -- a `mergeable_state: clean` read is trusted exactly as it is today. Layered like every other
+   *  settings field (`.gittensory.yml` `gate.requireFreshRebaseWindow` > DB > `null`). */
+  requireFreshRebaseWindowMinutes?: number | null | undefined;
+  /** Account-age throttle (#2561, anti-abuse): a PR from an account younger than this many days gets the
+   *  {@link newAccountLabel} and a tighter effective contributor cap -- friction/visibility, NEVER an
+   *  automatic close on account age alone. `null`/undefined (default) = off, zero behavior change. Never
+   *  fires for the repo owner, admin logins, or automation bots. PR-path only for now -- the issue-path
+   *  enforcement `maybeCloseIssueOverContributorCap` already goes through does not yet read this setting. */
+  accountAgeThresholdDays?: number | null | undefined;
+  /** The label applied to a below-threshold-age account's PR (#2561), mirroring {@link blacklistLabel}'s
+   *  configurable-with-fallback shape. Always populated by the DB layer (default `"new-account"`); optional so
+   *  existing settings fixtures/callers need not be touched. */
+  newAccountLabel?: string | undefined;
+  /** Per-command @gittensory rate limit (#2560, anti-abuse): generalizes the review-nag cooldown's counting
+   *  pattern (the audit-events ledger) to EVERY `@gittensory` command, keyed by `(actor, command, targetKey)` --
+   *  independent of, and complementary to, review-nag's own narrower thread-author-only scope. `"off"` (default)
+   *  is a no-op; `"hold"` posts a deterministic cooldown reply and skips the command's own dispatch. Always
+   *  populated by the DB layer (default `"off"`); optional so existing settings fixtures/callers need not be
+   *  touched. */
+  commandRateLimitPolicy?: "off" | "hold" | undefined;
+  /** Per-command rate limit (#2560): how many invocations of a single command an actor may make within
+   *  {@link commandRateLimitWindowHours} before the (N+1)th is throttled -- for a CHEAP command (cache-only,
+   *  no AI orchestrator call). Always populated by the DB layer (default `20`); optional so existing settings
+   *  fixtures/callers need not be touched. Only meaningful when {@link commandRateLimitPolicy} is not `"off"`. */
+  commandRateLimitMaxPerWindow?: number | undefined;
+  /** Per-command rate limit (#2560): the same threshold as {@link commandRateLimitMaxPerWindow}, but for an
+   *  AI-cost-bearing command (dispatches to a real orchestrator call: `ask`, `blockers`, `preflight`,
+   *  `reviewability`, `packet`, `duplicate-check`, `next-action`, `repo-fit`). Deliberately tighter than the
+   *  cheap-command default. Always populated by the DB layer (default `5`); optional so existing settings
+   *  fixtures/callers need not be touched. */
+  commandRateLimitAiMaxPerWindow?: number | undefined;
+  /** Per-command rate limit (#2560): the rolling window (in hours) both {@link commandRateLimitMaxPerWindow}
+   *  and {@link commandRateLimitAiMaxPerWindow} count against. Always populated by the DB layer (default `24`);
+   *  optional so existing settings fixtures/callers need not be touched. */
+  commandRateLimitWindowHours?: number | undefined;
   /** Agent-layer autonomy dial (#773): per-action-class level. Always populated by the DB layer (default
    *  `{}` = deny-by-default = "observe" for every class); optional so existing settings fixtures/callers
    *  need not be touched. The single source the action layer (#778) reads via `resolveAutonomy`. */
@@ -855,9 +907,14 @@ export type PullRequestDetailSyncStateRecord = {
   headSha?: string | null | undefined;
   filesSyncedAt?: string | null | undefined;
   reviewsSyncedAt?: string | null | undefined;
+  reviewsInvalidatedAt?: string | null | undefined;
   checksSyncedAt?: string | null | undefined;
   lastSyncedAt?: string | null | undefined;
   errorSummary?: string | null | undefined;
+  // #2537: durable bare-PR-state cache fields (mergeable_state/state from GET /pulls/{n}).
+  prMergeableState?: string | null | undefined;
+  prState?: string | null | undefined;
+  prStateFetchedAt?: string | null | undefined;
   updatedAt?: string | null | undefined;
 };
 

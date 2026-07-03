@@ -1190,6 +1190,151 @@ describe("createSqliteQueue (durable #980)", () => {
     expect(q.size()).toBe(0);
   });
 
+  describe("reviveDeadLetterJobs (#audit-rate-headroom)", () => {
+    beforeEach(() => {
+      // Deterministic zero jitter so a revived job's run_after is exactly "now" -- otherwise
+      // deterministicJitterMs's (up to 60s default) spread makes it not-yet-due for drain()/the poll
+      // tick in these tests. Mirrors the existing recoverProcessingJobs test convention in this file.
+      process.env.QUEUE_RECOVERY_JITTER_MS = "0";
+    });
+    afterEach(() => {
+      delete process.env.QUEUE_RECOVERY_JITTER_MS;
+      delete process.env.QUEUE_DEAD_LETTER_AUTO_RETRY_MAX_EXTRA_ATTEMPTS;
+      delete process.env.QUEUE_DEAD_LETTER_REVIVE_INTERVAL_MS;
+    });
+
+    it("requeues a dead job under the auto-retry ceiling and clears its last_error", async () => {
+      process.env.QUEUE_DEAD_LETTER_AUTO_RETRY_MAX_EXTRA_ATTEMPTS = "2";
+      const driver = makeDriver();
+      let calls = 0;
+      const q = createSqliteQueue(
+        driver,
+        async () => {
+          calls += 1;
+          throw new Error("boom");
+        },
+        { maxRetries: 1, backoffMs: () => 0 },
+      );
+      await q.binding.send(msg("x"));
+      await q.drain(); // dies at attempts=1 (maxRetries=1)
+      expect(q.deadCount()).toBe(1);
+      calls = 0;
+
+      const revived = q.reviveDeadLetterJobs();
+
+      expect(revived).toBe(1);
+      const { rows } = driver.query("SELECT status, attempts, last_error FROM _selfhost_jobs", []);
+      const row = rows[0] as { status: string; attempts: number; last_error: string | null };
+      // With zero jitter the revived job is immediately due, so kickAll()'s synchronous claim step may have
+      // already advanced it past 'pending' to 'processing' by the time this assertion runs -- either is
+      // correct proof of revival; only 'dead' would indicate the revival didn't happen.
+      expect(row.status).not.toBe("dead");
+      expect(row.attempts).toBe(1); // untouched -- one more failure re-dead-letters it, not a fresh budget
+      expect(row.last_error).toBeNull();
+
+      await q.drain(); // the one extra attempt the revival granted
+      expect(calls).toBe(1);
+      expect(q.deadCount()).toBe(1); // failed again -- back to dead, attempts now 2
+    });
+
+    it("stops reviving a job once it reaches the auto-retry ceiling (maxRetries + extra attempts)", async () => {
+      process.env.QUEUE_DEAD_LETTER_AUTO_RETRY_MAX_EXTRA_ATTEMPTS = "1";
+      const driver = makeDriver();
+      const q = createSqliteQueue(driver, async () => { throw new Error("boom"); }, { maxRetries: 1, backoffMs: () => 0 });
+      await q.binding.send(msg("x"));
+      await q.drain(); // attempts=1, dead (ceiling = maxRetries(1) + extra(1) = 2)
+
+      expect(q.reviveDeadLetterJobs()).toBe(1); // attempts(1) < ceiling(2) -- eligible
+      await q.drain(); // fails again -- attempts=2, dead again
+
+      expect(q.reviveDeadLetterJobs()).toBe(0); // attempts(2) is NOT < ceiling(2) -- exhausted, stays dead
+      expect(q.deadCount()).toBe(1);
+    });
+
+    it("is a no-op when there are no dead jobs", () => {
+      const driver = makeDriver();
+      const q = createSqliteQueue(driver, async () => undefined);
+      expect(q.reviveDeadLetterJobs()).toBe(0);
+    });
+
+    // REGRESSION (#2581 review defect, parity with the same fix in pg-queue.ts): the SELECT that finds eligible
+    // dead jobs is a stale snapshot. Without an "AND status='dead'" re-check on the UPDATE, a row that stops
+    // being 'dead' between the SELECT and this row's own UPDATE (e.g. claimed by an overlapping revive/process)
+    // would get silently flipped back to 'pending' regardless of its CURRENT status, letting it run a second
+    // time concurrently. Engineered here via a driver.query spy that injects the status change at the exact
+    // point the real revive UPDATE would otherwise race against it.
+    it("does not flip a row back to pending if it stops being 'dead' between the SELECT and its own UPDATE", async () => {
+      const driver = makeDriver();
+      const realQuery = driver.query.bind(driver);
+      const q = createSqliteQueue(driver, async () => { throw new Error("boom"); }, { maxRetries: 1, backoffMs: () => 0 });
+      await q.binding.send(msg("x"));
+      await q.drain(); // dies at attempts=1 (maxRetries=1)
+      expect(q.deadCount()).toBe(1);
+
+      vi.spyOn(driver, "query").mockImplementation((sql: string, params: unknown[]) => {
+        if (sql.includes("SET status='pending', run_after=?, last_error=NULL")) {
+          realQuery(`UPDATE _selfhost_jobs SET status='processing' WHERE id=?`, [params[1] as number]);
+        }
+        return realQuery(sql, params);
+      });
+
+      const revived = q.reviveDeadLetterJobs();
+
+      expect(revived).toBe(0); // the UPDATE's "AND status='dead'" matched zero rows -- not counted as revived
+      const { rows } = driver.query("SELECT status FROM _selfhost_jobs", []);
+      expect((rows[0] as { status: string }).status).toBe("processing"); // untouched, NOT reverted to pending
+    });
+
+    it("runs automatically on the configured revive interval while the queue is running", async () => {
+      process.env.QUEUE_DEAD_LETTER_REVIVE_INTERVAL_MS = "1000";
+      vi.useFakeTimers();
+      const driver = makeDriver();
+      let calls = 0;
+      const q = createSqliteQueue(
+        driver,
+        async () => {
+          calls += 1;
+          throw new Error("boom");
+        },
+        { maxRetries: 1, backoffMs: () => 0, pollIntervalMs: 50 },
+      );
+      await q.binding.send(msg("x"));
+      await vi.advanceTimersByTimeAsync(200); // dies at attempts=1
+      expect(q.deadCount()).toBe(1);
+      calls = 0;
+
+      q.start();
+      await vi.advanceTimersByTimeAsync(1000); // the revive interval fires once
+      await vi.advanceTimersByTimeAsync(200); // the poll tick picks up the revived job
+
+      expect(calls).toBe(1); // the auto-revived job was actually re-attempted
+      await q.stop();
+    });
+
+    // REGRESSION (#2581 review defect): the revive interval had no error handler of its own, so a thrown
+    // driver/metric failure on that tick would surface as an uncaught exception and could terminate the
+    // process -- exactly the failure mode pump()'s own try/catch already guards against for the main poll loop.
+    it("survives a reviveDeadLetterJobs() driver failure on the interval tick instead of crashing the process", async () => {
+      process.env.QUEUE_DEAD_LETTER_REVIVE_INTERVAL_MS = "1000";
+      vi.useFakeTimers();
+      const driver = makeDriver();
+      const realQuery = driver.query.bind(driver);
+      vi.spyOn(driver, "query").mockImplementation((sql: string, params: unknown[]) => {
+        if (sql.includes("WHERE status='dead' AND attempts<?")) throw new Error("disk I/O error");
+        return realQuery(sql, params);
+      });
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const q = createSqliteQueue(driver, async () => undefined, { maxRetries: 1 });
+
+      q.start();
+      await vi.advanceTimersByTimeAsync(1000); // the revive interval fires once -- would throw here if uncaught
+
+      const logged = errorSpy.mock.calls.map(([line]) => String(line));
+      expect(logged.some((line) => line.includes("selfhost_queue_dead_letter_revive_crashed") && line.includes("disk I/O error"))).toBe(true);
+      await q.stop();
+    });
+  });
+
   it("reschedules GitHub rate-limit failures without consuming the dead-letter budget", async () => {
     const driver = makeDriver();
     let calls = 0;

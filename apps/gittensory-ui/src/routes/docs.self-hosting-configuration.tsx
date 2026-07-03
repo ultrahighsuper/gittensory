@@ -2,6 +2,7 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 
 import { DocsPage } from "@/components/site/docs-page";
 import { Callout, CodeBlock, FeatureRow } from "@/components/site/primitives";
+import { SELFHOST_ENV_REFERENCE_MARKDOWN } from "@/lib/selfhost-env-reference";
 
 export const Route = createFileRoute("/docs/self-hosting-configuration")({
   head: () => ({
@@ -32,6 +33,12 @@ function SelfHostingConfiguration() {
       title="Configuration"
       description="The self-host configuration model: deployment env, private per-repo policy, feature flags, and review modes."
     >
+      <p>
+        This page is the exhaustive reference. For the short path — the required secrets plus a
+        conservative first-boot config — start with <code>.env.selfhost.example</code> in{" "}
+        <Link to="/docs/self-hosting-quickstart">Quickstart</Link> instead.
+      </p>
+
       <h2>Config layers</h2>
       <FeatureRow
         items={[
@@ -117,6 +124,14 @@ GITHUB_METADATA_CACHE_TTL_SECONDS=600`}
         Prometheus exports <code>gittensory_github_response_cache_total</code>, and the bundled
         self-host Grafana dashboard includes the hit/miss/coalesced/error breakdown.
       </Callout>
+
+      <h2>Generated env reference</h2>
+      <p>
+        This table is generated from <code>process.env.NAME</code> reads in{" "}
+        <code>src/selfhost/**</code> and <code>src/server.ts</code>. It intentionally includes names
+        and first source references only, never example values.
+      </p>
+      <CodeBlock filename="self-host env vars" code={SELFHOST_ENV_REFERENCE_MARKDOWN} />
 
       <h2>Per-PR feature flags</h2>
       <p>

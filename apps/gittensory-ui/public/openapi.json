@@ -8618,7 +8618,8 @@
           "reviewNagCooldownDays": {
             "type": "integer",
             "minimum": 0,
-            "exclusiveMinimum": true
+            "exclusiveMinimum": true,
+            "maximum": 365
           },
           "reviewNagLabel": {
             "type": "string"
@@ -8631,6 +8632,94 @@
           },
           "contributorCapLabel": {
             "type": "string"
+          },
+          "sizeGateMode": {
+            "type": "string",
+            "enum": [
+              "off",
+              "advisory",
+              "block"
+            ]
+          },
+          "gateDryRun": {
+            "type": "boolean"
+          },
+          "premergeContentRecheck": {
+            "type": "boolean"
+          },
+          "aiReviewMode": {
+            "type": "string",
+            "enum": [
+              "off",
+              "advisory",
+              "block"
+            ]
+          },
+          "aiReviewByok": {
+            "type": "boolean"
+          },
+          "aiReviewProvider": {
+            "type": "string",
+            "nullable": true,
+            "enum": [
+              "anthropic",
+              "openai",
+              null
+            ]
+          },
+          "aiReviewModel": {
+            "type": "string",
+            "nullable": true
+          },
+          "aiReviewAllAuthors": {
+            "type": "boolean"
+          },
+          "aiReviewCloseConfidence": {
+            "type": "number",
+            "nullable": true
+          },
+          "closeOwnerAuthors": {
+            "type": "boolean"
+          },
+          "badgeEnabled": {
+            "type": "boolean"
+          },
+          "requireFreshRebaseWindowMinutes": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 0,
+            "exclusiveMinimum": true
+          },
+          "accountAgeThresholdDays": {
+            "type": "integer",
+            "nullable": true,
+            "minimum": 0,
+            "exclusiveMinimum": true
+          },
+          "newAccountLabel": {
+            "type": "string"
+          },
+          "commandRateLimitPolicy": {
+            "type": "string",
+            "enum": [
+              "off",
+              "hold"
+            ]
+          },
+          "commandRateLimitMaxPerWindow": {
+            "type": "integer",
+            "minimum": 0,
+            "exclusiveMinimum": true
+          },
+          "commandRateLimitAiMaxPerWindow": {
+            "type": "integer",
+            "minimum": 0,
+            "exclusiveMinimum": true
+          },
+          "commandRateLimitWindowHours": {
+            "type": "integer",
+            "minimum": 0,
+            "exclusiveMinimum": true
           }
         },
         "required": [
@@ -8651,6 +8740,10 @@
           "selfAuthoredLinkedIssueGateMode",
           "firstTimeContributorGrace",
           "slopAiAdvisory",
+          "aiReviewMode",
+          "aiReviewByok",
+          "aiReviewAllAuthors",
+          "closeOwnerAuthors",
           "autoLabelEnabled",
           "gittensorLabel",
           "blacklistLabel",
@@ -9260,6 +9353,31 @@
               },
               "blacklistLabel": {
                 "type": "string"
+              },
+              "badgeEnabled": {
+                "type": "boolean"
+              },
+              "aiReviewMode": {
+                "type": "string",
+                "enum": [
+                  "off",
+                  "advisory",
+                  "block"
+                ]
+              },
+              "aiReviewByok": {
+                "type": "boolean"
+              },
+              "aiReviewProvider": {
+                "type": "string",
+                "nullable": true
+              },
+              "aiReviewModel": {
+                "type": "string",
+                "nullable": true
+              },
+              "aiReviewAllAuthors": {
+                "type": "boolean"
               }
             },
             "required": [
@@ -9285,6 +9403,12 @@
               "createMissingLabel",
               "includeMaintainerAuthors",
               "requireLinkedIssue",
+              "badgeEnabled",
+              "aiReviewMode",
+              "aiReviewByok",
+              "aiReviewProvider",
+              "aiReviewModel",
+              "aiReviewAllAuthors",
               "commandAuthorization"
             ]
           },
