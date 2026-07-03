@@ -290,6 +290,21 @@ describe("extractSubmittedSourceUrls — frontmatter parsing edge cases", () => 
     );
   });
 
+  it("does not surface a non-bare block-scalar indicator on a list field as a bogus URL", () => {
+    // `retrievalSources` is a list field; a block-scalar indicator (`|-`, `>-`, `|2`, …) is not a URL. The old
+    // guard only skipped the bare `|`/`>`, so `|-` leaked through as the literal url "|-".
+    for (const indicator of ["|-", ">-", "|+", "|2", ">2"]) {
+      const src = ["---", `retrievalSources: ${indicator}`, "  https://a.example/1", "  https://b.example/2", "---", "", "body"].join("\n");
+      const urls = extractSubmittedSourceUrls(src);
+      expect(urls.some((u) => u.url === indicator)).toBe(false);
+    }
+    // The bare forms were already skipped and must stay skipped.
+    for (const indicator of ["|", ">"]) {
+      const src = ["---", `retrievalSources: ${indicator}`, "  https://a.example/1", "---", "", "body"].join("\n");
+      expect(extractSubmittedSourceUrls(src).some((u) => u.url === indicator)).toBe(false);
+    }
+  });
+
   it("reads an INLINE bracketed list on a retrievalSources key line", () => {
     const src = [
       "---",

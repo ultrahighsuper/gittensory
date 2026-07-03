@@ -180,7 +180,10 @@ function listSourceUrlValues(source: string, spec: ContentRepoSpec): SubmittedSo
       const key = topLevel[1] as string;
       const value = topLevel[2] as string;
       activeField = spec.sourceUrlListFields.has(key) ? key : "";
-      if (activeField && value && value !== "|" && value !== ">") {
+      // Skip a YAML block-scalar indicator (`|`, `>`, `|-`, `>-`, `|+`, `|2`, …) so it is not read as a URL. Use the
+      // same complete indicator grammar as the sibling parser (parseSimpleFrontmatter): the old `!== "|" && !== ">"`
+      // check let every non-bare form (`|-`, `>2`, …) through, surfacing the indicator string itself as a bogus URL.
+      if (activeField && value && !/^[|>][+-]?\d*$/.test(value)) {
         for (const url of scalarSourceUrlValues(value)) {
           values.push({ field: activeField, url });
         }
