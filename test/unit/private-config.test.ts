@@ -235,6 +235,13 @@ describe("parseReviewSkill (#review-skills)", () => {
     expect(parseReviewSkill("z.md", "---\nname: a#b\n---\nb").name).toBe("a#b");
     // A `#` INSIDE a quoted scalar — even with preceding whitespace — is part of the value, not a comment.
     expect(parseReviewSkill("h.md", '---\nname: "SQL #1 Rubric"\nwhen: "src/#hot/**"  # trailing note\n---\nb')).toEqual({ name: "SQL #1 Rubric", when: "src/#hot/**", body: "b" });
+    // YAML-escaped double quotes and doubled single quotes are decoded, not treated as the terminator.
+    expect(parseReviewSkill("e.md", '---\nname: "SQL \\"Index\\" Rubric"\n---\nb').name).toBe('SQL "Index" Rubric');
+    expect(parseReviewSkill("o.md", "---\nname: 'Owner''s Rubric'\n---\nb").name).toBe("Owner's Rubric");
+    // An unquoted *-leading glob is not valid standalone YAML; it must still survive as the literal when-glob.
+    expect(parseReviewSkill("g.md", "---\nwhen: **/*.ts\n---\nb").when).toBe("**/*.ts");
+    // A non-string YAML scalar (e.g. a bare number) falls through to the literal text rather than a typed value.
+    expect(parseReviewSkill("n.md", "---\nname: 42\n---\nb").name).toBe("42");
     // A malformed unterminated quote degrades to stripping the stray leading quote (back-compat, not a crash).
     expect(parseReviewSkill("u.md", '---\nname: "unterminated\n---\nb').name).toBe("unterminated");
   });

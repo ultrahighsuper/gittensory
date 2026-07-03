@@ -168,24 +168,26 @@ function reviewContextFolders(repoFullName: string): string[] {
   return [join(`${owner}__${repo}`, "review"), join(repo, "review")];
 }
 
-/** Extract a YAML frontmatter scalar's value, quote-aware. A double/single-quoted scalar returns its quoted body
- *  verbatim (an inline comment or stray text after the closing quote is dropped, and a `#` INSIDE the quotes — e.g.
- *  `"SQL #1 Rubric"` — is preserved as part of the value). An unquoted scalar drops a trailing ` # …` inline comment
- *  (whitespace-before-hash; `a#b` keeps its `#`) and any stray surrounding quote. */
-function reviewSkillScalar(raw: string): string {
-  const s = raw.trim();
-  const quote = s[0];
-  if (quote === '"' || quote === "'") {
-    const close = s.indexOf(quote, 1);
-    if (close !== -1) return s.slice(1, close); // well-formed quoted scalar; a `#` within it is not a comment
+/** Read a `name:` / `when:` frontmatter value robustly. The value text (everything after the key on its line) is
+ *  parsed as a standalone YAML scalar, so the real parser handles quoting, escaped `\"` / doubled `''` quotes, and a
+ *  trailing inline comment — `"SQL #1 Rubric"` keeps its internal `#`, `SQL Rubric  # note` drops the comment. A
+ *  value the YAML parser rejects standalone — notably an unquoted glob that begins with a `*` wildcard — falls back
+ *  to a lenient strip (drop an inline comment and any surrounding quote) so those globs keep working. */
+function reviewSkillScalar(rawValue: string): string {
+  try {
+    const parsed = parseYaml(rawValue);
+    if (typeof parsed === "string") return parsed.trim();
+  } catch {
+    // not a standalone-parseable scalar (e.g. an unquoted *-leading glob) — fall through to the lenient strip
   }
-  return s.replace(/\s+#.*$/, "").replace(/^["']|["']$/g, "").trim();
+  return rawValue.replace(/\s+#.*$/, "").replace(/^["']|["']$/g, "").trim();
 }
 
 /** Parse a skill markdown file into {name, when, body}. YAML frontmatter (`---\nname:\nwhen:\n---`) is optional; name
- *  defaults to the filename and `when` to "always". `name`/`when` are read as quote-aware scalars so a quoted value
- *  keeps its contents (incl. an internal `#`) while a trailing inline comment is dropped — an unstripped comment
- *  corrupts the label and turns `when` into a glob that never matches, silently disabling the rubric. */
+ *  defaults to the filename and `when` to "always". `name`/`when` are decoded through the YAML parser (see
+ *  reviewSkillScalar) so a quoted value keeps its contents (incl. an internal `#`) while a trailing inline comment is
+ *  dropped — an unstripped comment corrupts the label and turns `when` into a glob that never matches, silently
+ *  disabling the rubric. */
 export function parseReviewSkill(filename: string, text: string): RepoReviewSkill {
   const fm = /^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/.exec(text);
   const head = fm?.[1] ?? "";
