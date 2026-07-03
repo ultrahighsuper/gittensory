@@ -168,21 +168,32 @@ function reviewContextFolders(repoFullName: string): string[] {
   return [join(`${owner}__${repo}`, "review"), join(repo, "review")];
 }
 
+/** Extract a YAML frontmatter scalar's value, quote-aware. A double/single-quoted scalar returns its quoted body
+ *  verbatim (an inline comment or stray text after the closing quote is dropped, and a `#` INSIDE the quotes — e.g.
+ *  `"SQL #1 Rubric"` — is preserved as part of the value). An unquoted scalar drops a trailing ` # …` inline comment
+ *  (whitespace-before-hash; `a#b` keeps its `#`) and any stray surrounding quote. */
+function reviewSkillScalar(raw: string): string {
+  const s = raw.trim();
+  const quote = s[0];
+  if (quote === '"' || quote === "'") {
+    const close = s.indexOf(quote, 1);
+    if (close !== -1) return s.slice(1, close); // well-formed quoted scalar; a `#` within it is not a comment
+  }
+  return s.replace(/\s+#.*$/, "").replace(/^["']|["']$/g, "").trim();
+}
+
 /** Parse a skill markdown file into {name, when, body}. YAML frontmatter (`---\nname:\nwhen:\n---`) is optional; name
- *  defaults to the filename and `when` to "always". */
+ *  defaults to the filename and `when` to "always". `name`/`when` are read as quote-aware scalars so a quoted value
+ *  keeps its contents (incl. an internal `#`) while a trailing inline comment is dropped — an unstripped comment
+ *  corrupts the label and turns `when` into a glob that never matches, silently disabling the rubric. */
 export function parseReviewSkill(filename: string, text: string): RepoReviewSkill {
   const fm = /^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/.exec(text);
   const head = fm?.[1] ?? "";
   const body = (fm?.[2] ?? text).trim();
-  // Drop an unquoted YAML inline comment (` # …`) before stripping surrounding quotes — symmetric with
-  // isReviewSkillEnabled. A trailing comment (`when: "**/*.sql"  # only sql`) is not part of the scalar; left in
-  // place it corrupts the label and, for `when`, produces a glob that never matches so the skill silently never
-  // fires. Also strip surrounding quotes on `name`, symmetric with `when` — a quoted scalar (`name: "SQL Rubric"`)
-  // is ordinary frontmatter, so neither the quotes nor the comment must survive into the label/glob.
-  const nameRaw = /(?:^|\n)name:\s*(.+)/.exec(head)?.[1]?.replace(/\s+#.*$/, "").trim();
-  const name = (nameRaw ?? "").replace(/^["']|["']$/g, "") || filename.replace(/\.md$/i, "");
-  const whenRaw = /(?:^|\n)when:\s*(.+)/.exec(head)?.[1]?.replace(/\s+#.*$/, "").trim();
-  const when = (whenRaw ?? "always").replace(/^["']|["']$/g, "") || "always";
+  const nameRaw = /(?:^|\n)name:\s*(.+)/.exec(head)?.[1];
+  const name = (nameRaw !== undefined ? reviewSkillScalar(nameRaw) : "") || filename.replace(/\.md$/i, "");
+  const whenRaw = /(?:^|\n)when:\s*(.+)/.exec(head)?.[1];
+  const when = (whenRaw !== undefined ? reviewSkillScalar(whenRaw) : "always") || "always";
   return { name, when, body };
 }
 
