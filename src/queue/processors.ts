@@ -78,6 +78,11 @@ import {
 } from "../db/repositories";
 import { pruneExpiredRecords } from "../db/retention";
 import {
+  effectiveIssueCapForAccountAge,
+  isBelowAccountAgeThreshold,
+  repoOwnerLoginFromFullName,
+} from "./account-age-throttle";
+import {
   backfillOpenPullRequestDetails,
   backfillRegisteredRepositories,
   backfillRepositorySegment,
@@ -4818,11 +4823,15 @@ async function maybeCloseIssueOverContributorCap(
   const globalCap = resolveGlobalContributorOpenItemCap(env);
   if ((typeof cap !== "number" && globalCap === null) || !authorLogin) return;
 
-  const repoOwner = repoFullName.includes("/") ? repoFullName.slice(0, repoFullName.indexOf("/")) : "";
+  const repoOwner = repoOwnerLoginFromFullName(repoFullName);
   const authorIsOwner = authorLogin.toLowerCase() === repoOwner.toLowerCase();
   const authorIsAdmin = parseGitHubLoginList(env.ADMIN_GITHUB_LOGINS).has(authorLogin.toLowerCase());
   const authorIsAutomationBot = isProtectedAutomationAuthor(authorLogin);
   if (authorIsOwner || authorIsAdmin || authorIsAutomationBot) return;
+
+  // Account-age throttle (#2561): mirror the PR-path cap tightening — a below-threshold author gets half
+  // the configured per-repo issue cap (rounded up, minimum 1). Fail-open when created_at cannot be resolved.
+  const isNewAccount = await isBelowAccountAgeThreshold(env, installationId, authorLogin, settings.accountAgeThresholdDays);
 
   // Install-wide check first (#2562): reuses the shared autoCloseExemptLogins list, same as the PR path.
   // verifiedGlobalOpenItemCount live-verifies every OTHER counted item before trusting it toward an
@@ -4874,6 +4883,8 @@ async function maybeCloseIssueOverContributorCap(
   // cooldown already honor -- see the matching comment on the PR-side per-repo cap in the PR maintenance path.
   if (typeof cap !== "number" || isAutoCloseExempt(authorLogin, settings.autoCloseExemptLogins)) return;
 
+  const effectiveIssueCap = effectiveIssueCapForAccountAge(cap, isNewAccount);
+
   const otherOpenIssues = await listOpenIssues(env, repoFullName);
   const authorLoginLower = authorLogin.toLowerCase();
   const otherAuthorIssueNumbers = otherOpenIssues
@@ -4911,7 +4922,7 @@ async function maybeCloseIssueOverContributorCap(
     .filter((number) => confirmedOpen.has(number))
     .concat(issue.number)
     .sort((a, b) => a - b);
-  const overCapNumbers = new Set(authorOpenIssueNumbers.slice(cap));
+  const overCapNumbers = new Set(authorOpenIssueNumbers.slice(effectiveIssueCap));
   if (overCapNumbers.size === 0) return;
 
   const planned = planAgentMaintenanceActions({
@@ -4924,7 +4935,7 @@ async function maybeCloseIssueOverContributorCap(
     authorIsAdmin,
     authorIsAutomationBot,
     ciState: "unverified",
-    contributorCapMatch: { matched: true, authorLogin, openCount: authorOpenIssueNumbers.length, cap, itemKind: "issues" },
+    contributorCapMatch: { matched: true, authorLogin, openCount: authorOpenIssueNumbers.length, cap: effectiveIssueCap, itemKind: "issues" },
     contributorCapLabel: settings.contributorCapLabel,
     pr: { labels: [] },
   });
@@ -5616,6 +5627,43 @@ async function processGitHubWebhook(
         );
       }
       await persistAdvisory(env, advisory);
+      // Account-age visibility (#2561 issue-path parity): label newly opened issues from below-threshold
+      // accounts when review_state_label autonomy is auto — same contract as the PR maintenance path.
+      if (payload.action === "opened" && installationId && issue.authorLogin) {
+        const repoOwner = repoOwnerLoginFromFullName(payload.repository.full_name);
+        const authorLogin = issue.authorLogin;
+        const authorIsOwner = authorLogin.toLowerCase() === repoOwner.toLowerCase();
+        const authorIsAdmin = parseGitHubLoginList(env.ADMIN_GITHUB_LOGINS).has(authorLogin.toLowerCase());
+        const authorIsAutomationBot = isProtectedAutomationAuthor(authorLogin);
+        const accountAgeThresholdDays = issueSettings.accountAgeThresholdDays;
+        if (
+          !authorIsOwner &&
+          !authorIsAdmin &&
+          !authorIsAutomationBot &&
+          typeof accountAgeThresholdDays === "number"
+        ) {
+          if (await isBelowAccountAgeThreshold(env, installationId, authorLogin, accountAgeThresholdDays)) {
+            if (resolveAutonomy(issueSettings.autonomy, "review_state_label") === "auto") {
+              const newAccountMode = resolveAgentActionMode({
+                globalPaused: isGlobalAgentPause(env) || (await isGlobalAgentFrozen(env)),
+                agentPaused: issueSettings.agentPaused,
+                agentDryRun: issueSettings.agentDryRun,
+              });
+              await ensurePullRequestLabel(
+                env,
+                installationId,
+                payload.repository.full_name,
+                issue.number,
+                issueSettings.newAccountLabel!,
+                { createMissingLabel: issueSettings.createMissingLabel, mode: newAccountMode },
+              ).catch(
+                /* v8 ignore next -- fail-safe: a label-application failure must never block the rest of the handler */
+                () => undefined,
+              );
+            }
+          }
+        }
+      }
       // Per-contributor open-issue cap (#2270, anti-abuse): the first issue-side auto-close path. Best-effort —
       // a failure here must never affect the advisory/notification handling above or the webhook overall.
       if (payload.action === "opened" && installationId) {
