@@ -193,6 +193,40 @@ describe("MinerGoalSpec parser (#2301)", () => {
     });
   });
 
+  it("normalizes a valid feasibilityGate block and keeps the spec present", () => {
+    const parsed = parseMinerGoalSpec({
+      feasibilityGate: {
+        enabled: false,
+        maxDuplicateClusterRisk: "medium",
+        suppressReasons: ["dup_medium", " dup_medium ", "", "issue_hold"],
+      },
+    });
+    expect(parsed.present).toBe(true); // a spec with only feasibilityGate set is still present
+    expect(parsed.spec.feasibilityGate).toEqual({
+      enabled: false,
+      maxDuplicateClusterRisk: "medium",
+      suppressReasons: ["dup_medium", "issue_hold"], // trimmed + deduped
+    });
+    expect(parsed.warnings).toEqual([]);
+  });
+
+  it("falls back each malformed feasibilityGate knob independently with targeted warnings", () => {
+    const parsed = parseMinerGoalSpec({
+      feasibilityGate: { enabled: "sometimes", maxDuplicateClusterRisk: "catastrophic", suppressReasons: "nope" },
+    });
+    expect(parsed.spec.feasibilityGate).toEqual(DEFAULT_MINER_GOAL_SPEC.feasibilityGate);
+    const warningText = parsed.warnings.join(" ");
+    expect(warningText).toMatch(/feasibilityGate\.enabled/);
+    expect(warningText).toMatch(/feasibilityGate\.maxDuplicateClusterRisk/);
+    expect(warningText).toMatch(/feasibilityGate\.suppressReasons/);
+  });
+
+  it("degrades a non-object feasibilityGate wholesale to defaults with one warning", () => {
+    const parsed = parseMinerGoalSpec({ minerEnabled: false, feasibilityGate: ["not", "a", "mapping"] });
+    expect(parsed.spec.feasibilityGate).toEqual(DEFAULT_MINER_GOAL_SPEC.feasibilityGate);
+    expect(parsed.warnings.join(" ")).toMatch(/"feasibilityGate" must be a mapping/i);
+  });
+
   it("parses valid JSON and YAML content", () => {
     expect(
       parseMinerGoalSpecContent(
