@@ -46,6 +46,30 @@
       "enum": ["encouraged", "neutral", "discouraged"],
       "default": "neutral",
       "description": "How strongly opening discovery issues is encouraged. Default: neutral."
+    },
+    "feasibilityGate": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Per-repo tuning for the analyze-phase feasibility gate. Defaults reproduce today's behavior.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether the feasibility gate is applied for this repo at all. Default: true."
+        },
+        "maxDuplicateClusterRisk": {
+          "type": "string",
+          "enum": ["none", "low", "medium", "high"],
+          "default": "high",
+          "description": "Highest duplicate-cluster risk a miner may proceed on before the gate escalates. Default: high."
+        },
+        "suppressReasons": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "default": [],
+          "description": "Feasibility avoid/raise reason keys this repo suppresses. Default: []."
+        }
+      }
     }
   }
 }

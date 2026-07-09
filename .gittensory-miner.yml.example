@@ -52,3 +52,16 @@ maxConcurrentClaims: 1
 # How strongly this repo encourages a miner to open discovery issues.
 # Values: encouraged | neutral | discouraged. Default: neutral.
 issueDiscoveryPolicy: neutral
+
+# Per-repo tuning for the analyze-phase feasibility gate. The defaults below reproduce today's
+# behavior, so leaving this block out (or copying it as-is) changes nothing. A non-object value,
+# or a single malformed knob, falls back to the default for that knob with a warning.
+feasibilityGate:
+  # Whether the feasibility gate is applied to this repo at all. Boolean. Default: true.
+  enabled: true
+  # Highest duplicate-cluster risk a miner may proceed on before the gate escalates.
+  # Values: none | low | medium | high. Default: high (tolerate any risk - no extra restriction).
+  maxDuplicateClusterRisk: high
+  # Feasibility avoid/raise reason keys this repo suppresses (never treated as blocking).
+  # String list. Default: [] (suppress nothing).
+  suppressReasons: []

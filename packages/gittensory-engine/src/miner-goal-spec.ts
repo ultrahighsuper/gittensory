@@ -1,5 +1,7 @@
 import { parse as parseYaml } from "yaml";
 
+import type { FeasibilityDuplicateClusterRisk } from "./feasibility.js";
+
 // MinerGoalSpec (#2293 / #2301). The type surface for `.gittensory-miner.yml` — the per-repo config a
 // maintainer/repo-owner drops in to tell an autonomous miner what to look for and how to behave when targeting
 // their repo. This is the MINER-side analogue of the review-side `.gittensory.yml` focus manifest (see
@@ -9,6 +11,29 @@ import { parse as parseYaml } from "yaml";
 
 /** How strongly opening discovery issues is encouraged for this repo. Mirrors the review-side policy vocabulary. */
 export type MinerIssueDiscoveryPolicy = "encouraged" | "neutral" | "discouraged";
+
+/**
+ * Per-repo tuning for the analyze-phase feasibility gate (`buildFeasibilityVerdict`, `feasibility.ts`). This is
+ * the CONFIG surface only — it lets a maintainer express how strict the gate should be on THEIR repo; wiring
+ * these knobs into the verdict composer is the gate consumer's job (#4270), not this parser's. See
+ * {@link DEFAULT_MINER_FEASIBILITY_GATE_POLICY}; the defaults reproduce today's behavior exactly (non-breaking).
+ */
+export type MinerFeasibilityGatePolicy = {
+  /** Whether the feasibility gate is applied for this repo at all. Set `false` to opt this repo out. Default: true. */
+  enabled: boolean;
+  /**
+   * The highest duplicate-cluster risk a miner may proceed on before the gate escalates — a cap on the gate's
+   * duplicate-cluster discriminant ({@link FeasibilityDuplicateClusterRisk}, reused so the vocabulary can't drift).
+   * Default: "high" (tolerate any risk — i.e. no extra per-repo restriction beyond the gate's built-in rules).
+   */
+  maxDuplicateClusterRisk: FeasibilityDuplicateClusterRisk;
+  /**
+   * Feasibility avoid/raise reason keys this repo opts to suppress (a suppressed reason is never treated as
+   * blocking by the gate consumer). String list, deduped/trimmed like the other list fields. Default: [] (suppress
+   * nothing).
+   */
+  suppressReasons: readonly string[];
+};
 
 /** Per-repo miner configuration parsed from `.gittensory-miner.yml`. See {@link DEFAULT_MINER_GOAL_SPEC}. */
 export type MinerGoalSpec = {
@@ -49,6 +74,11 @@ export type MinerGoalSpec = {
    * Default: neutral.
    */
   issueDiscoveryPolicy: MinerIssueDiscoveryPolicy;
+  /**
+   * Per-repo tuning for the analyze-phase feasibility gate. Default: {@link DEFAULT_MINER_FEASIBILITY_GATE_POLICY}
+   * (gate enabled, tolerate any duplicate-cluster risk, suppress nothing) — i.e. today's behavior.
+   */
+  feasibilityGate: MinerFeasibilityGatePolicy;
 };
 
 /** The tolerant parser result for `.gittensory-miner.yml`: the normalized spec plus parse warnings and whether the
@@ -69,6 +99,12 @@ export type ParsedMinerGoalSpec = {
  * Deep-frozen: this is a shared singleton, so runtime code can read it freely but must not mutate it — clone before
  * layering repo-specific overrides on top.
  */
+export const DEFAULT_MINER_FEASIBILITY_GATE_POLICY: Readonly<MinerFeasibilityGatePolicy> = Object.freeze({
+  enabled: true,
+  maxDuplicateClusterRisk: "high",
+  suppressReasons: Object.freeze([]),
+});
+
 export const DEFAULT_MINER_GOAL_SPEC: Readonly<MinerGoalSpec> = Object.freeze({
   minerEnabled: true,
   wantedPaths: Object.freeze([]),
@@ -77,6 +113,7 @@ export const DEFAULT_MINER_GOAL_SPEC: Readonly<MinerGoalSpec> = Object.freeze({
   blockedLabels: Object.freeze([]),
   maxConcurrentClaims: 1,
   issueDiscoveryPolicy: "neutral",
+  feasibilityGate: DEFAULT_MINER_FEASIBILITY_GATE_POLICY,
 });
 
 const MAX_MINER_GOAL_SPEC_BYTES = 32_768;
@@ -90,6 +127,10 @@ function cloneDefaultMinerGoalSpec(): MinerGoalSpec {
     blockedPaths: [...DEFAULT_MINER_GOAL_SPEC.blockedPaths],
     preferredLabels: [...DEFAULT_MINER_GOAL_SPEC.preferredLabels],
     blockedLabels: [...DEFAULT_MINER_GOAL_SPEC.blockedLabels],
+    feasibilityGate: {
+      ...DEFAULT_MINER_FEASIBILITY_GATE_POLICY,
+      suppressReasons: [...DEFAULT_MINER_FEASIBILITY_GATE_POLICY.suppressReasons],
+    },
   };
 }
 
@@ -149,6 +190,46 @@ function normalizeIssueDiscoveryPolicy(
   return fallback;
 }
 
+const FEASIBILITY_DUPLICATE_CLUSTER_RISKS: readonly FeasibilityDuplicateClusterRisk[] = ["none", "low", "medium", "high"];
+
+function normalizeDuplicateClusterRisk(
+  value: unknown,
+  field: string,
+  fallback: FeasibilityDuplicateClusterRisk,
+  warnings: string[],
+): FeasibilityDuplicateClusterRisk {
+  if (value === undefined || value === null) return fallback;
+  if (FEASIBILITY_DUPLICATE_CLUSTER_RISKS.includes(value as FeasibilityDuplicateClusterRisk)) {
+    return value as FeasibilityDuplicateClusterRisk;
+  }
+  warnings.push(
+    `MinerGoalSpec field "${field}" must be one of ${FEASIBILITY_DUPLICATE_CLUSTER_RISKS.join(", ")}; falling back to "${fallback}".`,
+  );
+  return fallback;
+}
+
+/** Tolerantly normalize the nested `feasibilityGate` policy block. A non-object degrades wholesale to defaults; a
+ *  present object normalizes each knob independently, so one malformed knob never discards the others. */
+function normalizeFeasibilityGate(value: unknown, warnings: string[]): MinerFeasibilityGatePolicy {
+  const defaults = DEFAULT_MINER_FEASIBILITY_GATE_POLICY;
+  if (value === undefined || value === null) return { ...defaults, suppressReasons: [...defaults.suppressReasons] };
+  if (typeof value !== "object" || Array.isArray(value)) {
+    warnings.push(`MinerGoalSpec field "feasibilityGate" must be a mapping; ignoring it and falling back to defaults.`);
+    return { ...defaults, suppressReasons: [...defaults.suppressReasons] };
+  }
+  const record = value as Record<string, unknown>;
+  return {
+    enabled: normalizeBoolean(record.enabled, "feasibilityGate.enabled", defaults.enabled, warnings),
+    maxDuplicateClusterRisk: normalizeDuplicateClusterRisk(
+      record.maxDuplicateClusterRisk,
+      "feasibilityGate.maxDuplicateClusterRisk",
+      defaults.maxDuplicateClusterRisk,
+      warnings,
+    ),
+    suppressReasons: normalizeStringList(record.suppressReasons, "feasibilityGate.suppressReasons", warnings),
+  };
+}
+
 function normalizePositiveInteger(value: unknown, field: string, fallback: number, warnings: string[]): number {
   if (value === undefined || value === null) return fallback;
   if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -181,7 +262,10 @@ function hasConfiguredGoalFields(spec: MinerGoalSpec): boolean {
     spec.preferredLabels.length > 0 ||
     spec.blockedLabels.length > 0 ||
     spec.maxConcurrentClaims !== DEFAULT_MINER_GOAL_SPEC.maxConcurrentClaims ||
-    spec.issueDiscoveryPolicy !== DEFAULT_MINER_GOAL_SPEC.issueDiscoveryPolicy
+    spec.issueDiscoveryPolicy !== DEFAULT_MINER_GOAL_SPEC.issueDiscoveryPolicy ||
+    spec.feasibilityGate.enabled !== DEFAULT_MINER_FEASIBILITY_GATE_POLICY.enabled ||
+    spec.feasibilityGate.maxDuplicateClusterRisk !== DEFAULT_MINER_FEASIBILITY_GATE_POLICY.maxDuplicateClusterRisk ||
+    spec.feasibilityGate.suppressReasons.length > 0
   );
 }
 
@@ -222,6 +306,7 @@ export function parseMinerGoalSpec(raw: unknown): ParsedMinerGoalSpec {
       DEFAULT_MINER_GOAL_SPEC.issueDiscoveryPolicy,
       warnings,
     ),
+    feasibilityGate: normalizeFeasibilityGate(record.feasibilityGate, warnings),
   };
   if (!hasConfiguredGoalFields(spec)) {
     warnings.push("MinerGoalSpec contained no recognized non-default goal fields; falling back to safe defaults.");

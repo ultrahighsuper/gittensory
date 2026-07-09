@@ -49,3 +49,19 @@ Maximum issues one miner may hold claimed on this repo at once.
 ### `issueDiscoveryPolicy` (`encouraged` | `neutral` | `discouraged`, default: `neutral`)
 
 How strongly this repo encourages a miner to open discovery issues.
+
+### `feasibilityGate` (object, default: gate enabled, tolerate any risk, suppress nothing)
+
+Per-repo tuning for the analyze-phase feasibility gate (`buildFeasibilityVerdict`). This is the configuration surface only; wiring these knobs into the verdict is the gate consumer's job. The defaults reproduce today's behavior, so adding the block is non-breaking. A non-object value degrades wholesale to defaults; each knob is normalized independently.
+
+- **`enabled`** (boolean, default: `true`) — whether the feasibility gate is applied for this repo at all. Set `false` to opt out.
+- **`maxDuplicateClusterRisk`** (`none` | `low` | `medium` | `high`, default: `high`) — the highest duplicate-cluster risk a miner may proceed on before the gate escalates; a cap on the gate's duplicate-cluster discriminant. `high` tolerates any risk (no extra restriction).
+- **`suppressReasons`** (string list, default: `[]`) — feasibility avoid/raise reason keys this repo opts to suppress (a suppressed reason is never treated as blocking). Trimmed and deduped like the other list fields.
+
+```yaml
+feasibilityGate:
+  enabled: true
+  maxDuplicateClusterRisk: medium
+  suppressReasons:
+    - duplicate_cluster_medium
+```

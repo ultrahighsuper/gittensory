@@ -188,11 +188,13 @@ export {
 } from "./ai-policy-map.js";
 export {
   DEFAULT_MINER_GOAL_SPEC,
+  DEFAULT_MINER_FEASIBILITY_GATE_POLICY,
   parseMinerGoalSpec,
   parseMinerGoalSpecContent,
   discoverMinerGoalSpecPath,
   MINER_GOAL_SPEC_FILENAMES,
   type MinerGoalSpec,
+  type MinerFeasibilityGatePolicy,
   type MinerIssueDiscoveryPolicy,
   type ParsedMinerGoalSpec,
 } from "./miner-goal-spec.js";

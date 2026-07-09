@@ -45,6 +45,7 @@ test("parseMinerGoalSpec: valid raw config normalizes every field and keeps non-
     blockedLabels: ["duplicate"],
     maxConcurrentClaims: 2,
     issueDiscoveryPolicy: "encouraged",
+    feasibilityGate: { enabled: true, maxDuplicateClusterRisk: "high", suppressReasons: [] },
   });
   assert.deepEqual(parsed.warnings, []);
 });
@@ -130,6 +131,7 @@ test("parseMinerGoalSpec: malformed fields fall back independently with targeted
     blockedLabels: ["wontfix"],
     maxConcurrentClaims: 1,
     issueDiscoveryPolicy: "neutral",
+    feasibilityGate: { enabled: true, maxDuplicateClusterRisk: "high", suppressReasons: [] },
   });
   const warningText = parsed.warnings.join(" ");
   assert.match(warningText, /minerEnabled/i);
@@ -160,6 +162,55 @@ test("parseMinerGoalSpec: unknown-only or default-only content stays absent with
   assert.equal(explicitDefaults.present, false);
   assert.deepEqual(explicitDefaults.spec, DEFAULT_MINER_GOAL_SPEC);
   assert.match(explicitDefaults.warnings.join(" "), /no recognized non-default goal fields/i);
+});
+
+test("parseMinerGoalSpec: a valid feasibilityGate block normalizes each knob and keeps the spec present", () => {
+  const parsed = parseMinerGoalSpec({
+    feasibilityGate: {
+      enabled: false,
+      maxDuplicateClusterRisk: "medium",
+      suppressReasons: ["duplicate_cluster_medium", " duplicate_cluster_medium ", "", "issue_hold"],
+    },
+  });
+
+  assert.equal(parsed.present, true); // a spec with ONLY feasibilityGate set is still "present"
+  assert.deepEqual(parsed.spec.feasibilityGate, {
+    enabled: false,
+    maxDuplicateClusterRisk: "medium",
+    suppressReasons: ["duplicate_cluster_medium", "issue_hold"], // trimmed + deduped like the other list fields
+  });
+  assert.deepEqual(parsed.warnings, []);
+});
+
+test("parseMinerGoalSpec: a malformed feasibilityGate normalizes each knob independently with targeted warnings", () => {
+  const parsed = parseMinerGoalSpec({
+    feasibilityGate: {
+      enabled: "sometimes", // not a boolean
+      maxDuplicateClusterRisk: "catastrophic", // outside the enum
+      suppressReasons: "not-a-list", // not a list
+    },
+  });
+
+  // Each malformed knob falls back to its own default; one bad knob never discards the others.
+  assert.deepEqual(parsed.spec.feasibilityGate, DEFAULT_MINER_GOAL_SPEC.feasibilityGate);
+  const warningText = parsed.warnings.join(" ");
+  assert.match(warningText, /feasibilityGate\.enabled/);
+  assert.match(warningText, /feasibilityGate\.maxDuplicateClusterRisk/);
+  assert.match(warningText, /feasibilityGate\.suppressReasons/);
+});
+
+test("parseMinerGoalSpec: a non-object feasibilityGate degrades wholesale to defaults with one warning", () => {
+  const parsed = parseMinerGoalSpec({ minerEnabled: false, feasibilityGate: ["not", "a", "mapping"] });
+  assert.deepEqual(parsed.spec.feasibilityGate, DEFAULT_MINER_GOAL_SPEC.feasibilityGate);
+  assert.match(parsed.warnings.join(" "), /"feasibilityGate" must be a mapping/i);
+});
+
+test("parseMinerGoalSpec: a feasibilityGate equal to the defaults does not, by itself, make the spec present", () => {
+  const parsed = parseMinerGoalSpec({
+    feasibilityGate: { enabled: true, maxDuplicateClusterRisk: "high", suppressReasons: [] },
+  });
+  assert.equal(parsed.present, false); // all-default → absent, mirroring the other fields
+  assert.deepEqual(parsed.spec, DEFAULT_MINER_GOAL_SPEC);
 });
 
 test("parseMinerGoalSpecContent: empty content returns an absent default spec", () => {
