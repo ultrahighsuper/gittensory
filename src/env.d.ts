@@ -11,12 +11,21 @@ declare global {
      *  local/openai-compatible endpoint (ollama). Built at boot from AI_EMBED_BASE_URL/AI_EMBED_MODEL. Absent ⇒
      *  `createReviewAdapters` falls back to `env.AI` (byte-identical to before). */
     AI_EMBED?: Ai;
+    /** Self-host (visual-vision, #4111/#4335): a DEDICATED vision-capable provider, separate from both the
+     *  review chain and the embed provider — a local/openai-compatible endpoint (ollama + a vision-language
+     *  model). Built at boot from AI_VISION_BASE_URL/AI_VISION_MODEL. Absent ⇒ visual-vision advisory falls
+     *  back to requiring a maintainer BYOK key (the only option before this binding existed). */
+    AI_VISION?: Ai;
     /** Self-host RAG vector adapter. Cloudflare no longer binds Vectorize for hosted reviews; the Node runtime
      *  injects Qdrant/sqlite/pg adapters here when configured. Absent ⇒ no RAG, review proceeds with no retrieved
      *  context. */
     VECTORIZE?: Vectorize;
     /** Self-host RAG vector width. Must match the configured embedding model and vector backend. */
     QDRANT_DIM?: string;
+    /** Self-host RAG embed batch size (items per embed-provider call). Defaults to the shipped
+     *  Workers-AI-safe constant (96) when unset — this override exists for self-host operators tuning
+     *  throughput on their own hardware (e.g. GPU-accelerated Ollama), not to change the hosted default. */
+    AI_EMBED_BATCH?: string;
     /** Optional self-host review audit + visual-capture blob store. The Node runtime injects a filesystem-backed
      *  store when REVIEW_AUDIT_DIR is set, or an S3-compatible-bucket-backed store (an operator's own Cloudflare
      *  R2 bucket, or any other S3-compatible provider) when REVIEW_AUDIT_S3_BUCKET + _ENDPOINT +
