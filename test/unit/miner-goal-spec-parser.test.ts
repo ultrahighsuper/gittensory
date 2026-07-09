@@ -53,6 +53,7 @@ describe("MinerGoalSpec parser (#2301)", () => {
         blockedLabels: ["duplicate"],
         maxConcurrentClaims: 2,
         issueDiscoveryPolicy: "encouraged",
+        feasibilityGate: { enabled: true, maxDuplicateClusterRisk: "high", suppressReasons: [] },
       },
       warnings: ['MinerGoalSpec field "blockedPaths" truncated an over-long entry.'],
     });
@@ -143,6 +144,7 @@ describe("MinerGoalSpec parser (#2301)", () => {
         blockedLabels: ["wontfix"],
         maxConcurrentClaims: 1,
         issueDiscoveryPolicy: "neutral",
+        feasibilityGate: { enabled: true, maxDuplicateClusterRisk: "high", suppressReasons: [] },
       },
       warnings: expect.arrayContaining([
         expect.stringMatching(/minerEnabled/i),
