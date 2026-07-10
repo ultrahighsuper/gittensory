@@ -251,6 +251,13 @@ export {
   type RepoMapSymbol,
   type RepoMapSymbolKind,
 } from "./miner/repo-map.js";
+export {
+  createAgentSdkCodingAgentDriver,
+  type AgentSdkHooks,
+  type AgentSdkQueryFn,
+  type AgentSdkQueryOptions,
+  type CreateAgentSdkDriverOptions,
+} from "./miner/agent-sdk-driver.js";
 export * from "./plan-export.js";
 export { countPlanStepsByStatus } from "./plan-step-stats.js";
 export { countPlanSteps } from "./plan-step-count.js";
