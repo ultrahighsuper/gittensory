@@ -198,6 +198,19 @@ export {
   type CliSubprocessSpawnFn,
 } from "./miner/cli-subprocess-driver.js";
 export {
+  addWorktree,
+  planWorktree,
+  removeWorktree,
+  shouldRetainWorktree,
+  WORKTREE_BRANCH_PREFIX,
+  WORKTREE_SUBDIR,
+  type WorktreeAddResult,
+  type WorktreeExecFn,
+  type WorktreeExecResult,
+  type WorktreePlan,
+  type WorktreeRemoveResult,
+} from "./miner/worktree-allocator.js";
+export {
   invokeCodingAgentDriver,
   type AttemptLogSink,
 } from "./miner/coding-agent-invoke.js";
