@@ -3675,9 +3675,14 @@ export function deserializeCachedCiAggregate(
       nonRequiredFailingDetails,
       // #4372: advisoryHoldDetails is NOT persisted in the durable cache (no column) — deliberately. The
       // manual-review routing it drives fires on the fresh, webhook-invalidated live read that populates this
-      // cache entry (an advisory check_run completing invalidates the entry for that head SHA), and the hold
-      // label is applied idempotently there. The exclusion's effect on the disposition (a settled advisory check
-      // no longer holding the gate) DOES round-trip, because it is already baked into the cached `ciState`.
+      // cache entry: an advisory check_run's own `completed` webhook runs maybeReReviewOnCiCompletion, which calls
+      // invalidateCiStateCache for that PR/head-SHA (app-agnostic — it skips only the bot's OWN checks via
+      // isSelfAuthoredCiCompletionWebhook, never a third party's) BEFORE re-reviewing, so the disposition pass sees
+      // a genuine miss and re-fetches live, where reduceLiveCiAggregate re-derives the hold and the label is applied
+      // idempotently. A later cache HIT reconstructing [] is therefore never the path that decides a hold. The
+      // exclusion's effect (a settled advisory check no longer holding the gate) DOES round-trip regardless, since
+      // it is already baked into the cached `ciState`. Pinned end-to-end by pr-detail-durable-cache.test.ts (the
+      // deserialize-[] + invalidation halves) and backfill-2.test.ts (the fresh read re-deriving the hold).
       advisoryHoldDetails: [],
       ciCompletenessWarning: cached.ciCompletenessWarning ?? null,
     };

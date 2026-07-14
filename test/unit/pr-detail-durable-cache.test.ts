@@ -814,5 +814,30 @@ describe("durable CI-state cache (#selfhost-ci-verification)", () => {
       await expect(invalidateCiStateCache(readFailEnv, "owner/repo", 93)).resolves.toBeUndefined();
       expect(await getPullRequestDetailSyncState(baseEnv, "owner/repo", 93)).toMatchObject({ status: "never_synced", ciState: null });
     });
+
+    // #4372: closes the loop on the one design tradeoff of the advisory-check-runs feature — advisoryHoldDetails is
+    // NOT a persisted column, so a durable cache HIT reconstructs it as []. That is safe ONLY because an advisory
+    // check-run's own `completed` webhook invalidates this entry (maybeReReviewOnCiCompletion → invalidateCiStateCache,
+    // app-agnostic: it skips only the bot's OWN checks, never a third party's), forcing the next disposition read to
+    // MISS → re-fetch live → reduceLiveCiAggregate re-derives the non-empty hold (covered in backfill-2.test.ts). This
+    // test pins both halves so the guarantee is verifiable from the diff, not just asserted in prose.
+    it("advisoryHoldDetails is not persisted (a cache HIT reconstructs []), and invalidation clears the entry so the next read re-fetches live and re-derives the hold", async () => {
+      const env = createTestEnv();
+      const withHold: LiveCiAggregate = {
+        ...sampleAggregate,
+        ciState: "passed",
+        failingDetails: [],
+        advisoryHoldDetails: [{ name: "Third-Party Scan", appSlug: "example-scanner", conclusion: "action_required" }],
+      };
+      await writeThroughCiStateCache(env, "owner/repo", 94, null, "sha1", "req|adv:x", withHold);
+      // A cache HIT never carries the hold — the field has no column, so deserialize reconstructs [] deliberately.
+      const cached = await getPullRequestDetailSyncState(env, "owner/repo", 94);
+      expect(deserializeCachedCiAggregate(cached!)?.advisoryHoldDetails).toEqual([]);
+      // ...but the ciState the exclusion produced ("passed", not stuck "pending") DOES round-trip via its column.
+      expect(deserializeCachedCiAggregate(cached!)?.ciState).toBe("passed");
+      // The advisory check's completion webhook invalidates the entry → the next read is a genuine miss → live re-fetch.
+      await invalidateCiStateCache(env, "owner/repo", 94);
+      expect(await getPullRequestDetailSyncState(env, "owner/repo", 94)).toMatchObject({ ciState: null, ciStateFetchedAt: null });
+    });
   });
 });
