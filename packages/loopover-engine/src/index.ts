@@ -416,6 +416,10 @@ export {
 // live gate does), not this file's full internal surface.
 export { buildCollisionReport, type CollisionCluster, type CollisionReport } from "./signals/predicted-gate-engine.js";
 export type { CollisionItem } from "./types/predicted-gate-types.js";
+// Package-local twin of the host engine's buildIssueQualityReport (#6057). Do NOT re-export from
+// `./signals/engine.js` — that file is excluded from this package's tsc emit (host-bound imports) and
+// pulling it into the public barrel breaks `npm run build` (closed #6139).
+export { buildIssueQualityReport } from "./signals/issue-quality-report.js";
 // Unlinked-issue candidate pre-filter (#4883), extracted out of src/signals/unlinked-issue-candidates.ts so the
 // miner's self-review can run the SAME deterministic recall pass the maintainer gate uses to flag a PR's
 // likely-but-unlinked issue, instead of a driftable copy. PURE — no IO, no AI call.
