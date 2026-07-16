@@ -9,6 +9,7 @@ import {
   resolveWorktreeAllocatorDbPath,
   resolveWorktreeBaseDir,
 } from "../../packages/loopover-miner/lib/worktree-allocator.js";
+import { cleanupResourceCount, resetProcessLifecycleForTesting } from "../../packages/loopover-miner/lib/process-lifecycle.js";
 
 const roots: string[] = [];
 const allocators: Array<{ close(): void }> = [];
@@ -97,5 +98,23 @@ describe("loopover-miner worktree allocator scaffolding (#4298)", () => {
     const first = allocator.acquire("attempt-a", "acme/widgets");
     const second = allocator.acquire("attempt-a", "acme/widgets");
     expect(second.worktreePath).toBe(first.worktreePath);
+  });
+
+  it("registers the opened store for crash-safe cleanup and unregisters it on close (#6600)", () => {
+    // Opening through local-store.js's openLocalStoreDb registers the handle so a SIGINT/SIGTERM/crash
+    // mid-write is flushed by installCliSignalHandlers — exactly as the three sibling stores already are.
+    resetProcessLifecycleForTesting();
+    const root = mkdtempSync(join(tmpdir(), "loopover-miner-worktree-cleanup-"));
+    roots.push(root);
+
+    expect(cleanupResourceCount()).toBe(0);
+    const allocator = openWorktreeAllocator({
+      dbPath: join(root, "worktree-allocator.sqlite3"),
+      worktreeBaseDir: join(root, "worktrees"),
+      maxConcurrency: 1,
+    });
+    expect(cleanupResourceCount()).toBe(1);
+    allocator.close();
+    expect(cleanupResourceCount()).toBe(0);
   });
 });
