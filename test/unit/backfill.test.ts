@@ -63,7 +63,6 @@ import {
 } from "../../src/github/client";
 import { normalizeRegistryPayload } from "../../src/registry/normalize";
 import { persistRegistrySnapshot } from "../../src/registry/sync";
-import { upsertRepoFocusManifest } from "../../src/signals/focus-manifest-loader";
 import { renderMetrics, resetMetrics } from "../../src/selfhost/metrics";
 import { createTestEnv } from "../helpers/d1";
 
